@@ -2,6 +2,8 @@
 
 Read-only Klipper status display for the ESP32-2432S028R Cheap Yellow Display.
 
+![CYD Printer Display showing live Klipper status](image/image_1.png)
+
 The firmware polls Moonraker every 1.5 seconds and displays:
 
 - Klipper and print state
