@@ -1,0 +1,18 @@
+[project]
+name = "cyd-printer-ai-gateway"
+version = "0.1.0"
+description = "Read-only Moonraker and camera gateway for the CYD printer assistant"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "openai>=1.100,<3",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

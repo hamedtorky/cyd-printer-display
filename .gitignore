@@ -1,3 +1,9 @@
 .pio/
 .vscode/
+.test-venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+gateway/.env
 include/config.h

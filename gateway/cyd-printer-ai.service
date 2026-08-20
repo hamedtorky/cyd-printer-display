@@ -1,0 +1,19 @@
+[Unit]
+Description=CYD Printer AI Gateway
+After=network-online.target moonraker.service crowsnest.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hamed
+WorkingDirectory=/home/hamed/cyd-printer-display/gateway
+EnvironmentFile=/home/hamed/cyd-printer-display/gateway/.env
+ExecStart=/home/hamed/cyd-printer-display/gateway/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8787
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+
