@@ -6,6 +6,7 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <WebSocketsClient.h>
 #include <XPT2046_Touchscreen.h>
 
 #include "config.h"
@@ -16,7 +17,7 @@ constexpr uint16_t kBlack = TFT_BLACK;
 constexpr uint16_t kWhite = TFT_WHITE;
 constexpr uint16_t kRed = TFT_RED;
 constexpr uint16_t kYellow = TFT_YELLOW;
-constexpr unsigned long kPollIntervalMs = 1500;
+constexpr unsigned long kFallbackPollIntervalMs = 2000;
 constexpr unsigned long kWifiRetryMs = 10000;
 constexpr unsigned long kDimAfterMs = 60000;
 constexpr unsigned long kSleepAfterMs = 300000;
@@ -32,14 +33,18 @@ constexpr int kLedRed = 4;
 constexpr int kLedGreen = 16;
 constexpr int kLedBlue = 17;
 constexpr int kNavigationTop = 207;
+constexpr unsigned long kCancelHoldMs = 2000;
 
 TFT_eSPI display;
 SPIClass touchSpi(VSPI);
 XPT2046_Touchscreen touch(kTouchCs, kTouchIrq);
+WebSocketsClient moonrakerSocket;
 Preferences preferences;
 unsigned long lastPollAt = 0;
 unsigned long lastWifiAttemptAt = 0;
 unsigned long lastInteractionAt = 0;
+bool socketConnected = false;
+String socketHeaders;
 
 enum class Page : uint8_t { Dashboard, Health, Controls, Ai };
 Page activePage = Page::Dashboard;
@@ -70,6 +75,8 @@ struct PrinterStatus {
   bool filamentMoving = false;
   bool hasFilamentSensors = false;
   float eddyTemperature = 0;
+  int speedPercent = 100;
+  int flowPercent = 100;
 };
 
 PrinterStatus printer;
@@ -101,6 +108,19 @@ struct HealthSnapshot {
 };
 
 HealthSnapshot shownHealth;
+
+struct ControlSnapshot {
+  String action;
+  String state;
+  String message;
+  int speedPercent = -1;
+  int flowPercent = -1;
+};
+
+ControlSnapshot shownControls;
+String controlMessage;
+
+bool postMoonraker(const String &path);
 
 String shorten(const String &value, size_t maximum) {
   if (value.length() <= maximum) return value;
@@ -151,7 +171,10 @@ void setRgb(bool red, bool green, bool blue) {
 }
 
 void updateRgb() {
-  if (!printer.online || printer.klippyState != "ready" || printer.printState == "error") {
+  const bool filamentAlert = printer.printState == "printing" && printer.hasFilamentSensors &&
+                             (!printer.filamentPresent || !printer.filamentMoving);
+  if (!printer.online || printer.klippyState != "ready" || printer.printState == "error" ||
+      filamentAlert) {
     setRgb(true, false, false);
   } else if (printer.printState == "printing") {
     setRgb(true, true, false);
@@ -360,11 +383,62 @@ void renderHealth(bool force = false) {
 void renderControls() {
   drawPageTitle("SAFE CONTROLS");
   display.setTextDatum(MC_DATUM);
-  display.setTextColor(kWhite, kBlack);
-  display.drawString("Controls will unlock after", 160, 82, 2);
-  display.drawString("Moonraker command safety is enabled.", 160, 106, 2);
+  display.drawRoundRect(10, 48, 145, 42, 7, kYellow);
+  display.drawRoundRect(165, 48, 145, 42, 7, kRed);
   display.setTextColor(kYellow, kBlack);
-  display.drawString("No commands sent in this build", 160, 151, 2);
+  display.drawString("SPEED", 46, 112, 2);
+  display.drawString("FLOW", 46, 158, 2);
+  display.drawRoundRect(102, 98, 43, 38, 6, kWhite);
+  display.drawRoundRect(264, 98, 43, 38, 6, kWhite);
+  display.drawRoundRect(102, 144, 43, 38, 6, kWhite);
+  display.drawRoundRect(264, 144, 43, 38, 6, kWhite);
+  display.setTextColor(kWhite, kBlack);
+  display.drawString("-", 123, 117, 4);
+  display.drawString("+", 285, 117, 4);
+  display.drawString("-", 123, 163, 4);
+  display.drawString("+", 285, 163, 4);
+  shownControls = ControlSnapshot{};
+}
+
+void updateControlValues(bool force = false) {
+  String action = "NO ACTIVE PRINT";
+  if (printer.printState == "paused") action = "RESUME";
+  if (printer.printState == "printing") action = "PAUSE";
+  if (force || action != shownControls.action) {
+    display.fillRect(12, 50, 141, 38, kBlack);
+    display.setTextColor(kYellow, kBlack);
+    display.setTextDatum(MC_DATUM);
+    display.drawString(action, 82, 69, 4);
+    shownControls.action = action;
+  }
+  if (force || printer.printState != shownControls.state) {
+    display.fillRect(167, 50, 141, 38, kBlack);
+    display.setTextColor(kRed, kBlack);
+    display.setTextDatum(MC_DATUM);
+    display.drawString("HOLD CANCEL", 237, 69, 2);
+    shownControls.state = printer.printState;
+  }
+  if (force || printer.speedPercent != shownControls.speedPercent) {
+    display.fillRect(151, 102, 105, 30, kBlack);
+    display.setTextColor(kWhite, kBlack);
+    display.setTextDatum(MC_DATUM);
+    display.drawString(String(printer.speedPercent) + "%", 203, 117, 4);
+    shownControls.speedPercent = printer.speedPercent;
+  }
+  if (force || printer.flowPercent != shownControls.flowPercent) {
+    display.fillRect(151, 148, 105, 30, kBlack);
+    display.setTextColor(kWhite, kBlack);
+    display.setTextDatum(MC_DATUM);
+    display.drawString(String(printer.flowPercent) + "%", 203, 163, 4);
+    shownControls.flowPercent = printer.flowPercent;
+  }
+  if (force || controlMessage != shownControls.message) {
+    display.fillRect(10, 187, 300, 18, kBlack);
+    display.setTextColor(controlMessage.startsWith("Failed") ? kRed : kWhite, kBlack);
+    display.setTextDatum(MC_DATUM);
+    display.drawString(shorten(controlMessage, 42), 160, 195, 2);
+    shownControls.message = controlMessage;
+  }
 }
 
 void renderAi() {
@@ -391,6 +465,7 @@ void redrawActivePage() {
       break;
     case Page::Controls:
       renderControls();
+      updateControlValues(true);
       break;
     case Page::Ai:
       renderAi();
@@ -490,18 +565,69 @@ bool readTouch(int &screenX, int &screenY) {
 
 void handleTouch() {
   static bool wasTouched = false;
+  static bool cancelArmed = false;
+  static bool cancelSent = false;
+  static unsigned long cancelStartedAt = 0;
   int x = 0;
   int y = 0;
   const bool isTouched = readTouch(x, y);
+  const bool wasSleeping = millis() - lastInteractionAt >= kSleepAfterMs;
   if (isTouched) {
     lastInteractionAt = millis();
     setBacklight(kBacklightBright);
   }
-  if (isTouched && !wasTouched && y >= kNavigationTop) {
+  if (isTouched && !wasTouched && !wasSleeping && y >= kNavigationTop) {
     const Page selected = static_cast<Page>(constrain(x / 80, 0, 3));
     if (selected != activePage) {
       activePage = selected;
       redrawActivePage();
+    }
+  }
+  if (!isTouched) {
+    cancelArmed = false;
+    cancelSent = false;
+  }
+  if (activePage == Page::Controls && isTouched && !wasSleeping) {
+    if (!wasTouched) {
+      if (x >= 10 && x <= 155 && y >= 48 && y <= 90) {
+        const bool resume = printer.printState == "paused";
+        const bool pause = printer.printState == "printing";
+        const bool ok = (resume || pause) &&
+                        postMoonraker(resume ? "/printer/print/resume" : "/printer/print/pause");
+        controlMessage = !(resume || pause) ? "No active print"
+                         : ok              ? (resume ? "Resume requested" : "Pause requested")
+                                           : "Failed to send command";
+        updateControlValues(true);
+      } else if (x >= 165 && x <= 310 && y >= 48 && y <= 90 && printer.printState == "printing") {
+        cancelArmed = true;
+        cancelStartedAt = millis();
+        controlMessage = "Keep holding to cancel";
+        updateControlValues(true);
+      } else if (y >= 98 && y <= 136 && (x >= 102 && x <= 145 || x >= 264 && x <= 307)) {
+        const int delta = x < 200 ? -10 : 10;
+        const int requested = constrain(printer.speedPercent + delta, 50, 200);
+        const bool ok = printer.printState == "printing" &&
+                        postMoonraker(String("/printer/gcode/script?script=M220%20S") + requested);
+        controlMessage = printer.printState != "printing" ? "Speed changes require a print"
+                         : ok ? String("Speed requested: ") + requested + "%"
+                              : "Failed to set speed";
+        updateControlValues(true);
+      } else if (y >= 144 && y <= 182 && (x >= 102 && x <= 145 || x >= 264 && x <= 307)) {
+        const int delta = x < 200 ? -5 : 5;
+        const int requested = constrain(printer.flowPercent + delta, 50, 150);
+        const bool ok = printer.printState == "printing" &&
+                        postMoonraker(String("/printer/gcode/script?script=M221%20S") + requested);
+        controlMessage = printer.printState != "printing" ? "Flow changes require a print"
+                         : ok ? String("Flow requested: ") + requested + "%"
+                              : "Failed to set flow";
+        updateControlValues(true);
+      }
+    }
+    if (cancelArmed && !cancelSent && millis() - cancelStartedAt >= kCancelHoldMs) {
+      cancelSent = true;
+      const bool ok = postMoonraker("/printer/print/cancel");
+      controlMessage = ok ? "Print cancel requested" : "Failed to cancel print";
+      updateControlValues(true);
     }
   }
   wasTouched = isTouched;
@@ -554,6 +680,159 @@ void connectWifi() {
   Serial.println(WiFi.localIP());
 }
 
+void refreshActivePage() {
+  switch (activePage) {
+    case Page::Dashboard:
+      render();
+      break;
+    case Page::Health:
+      renderHealth();
+      break;
+    case Page::Controls:
+      updateControlValues();
+      break;
+    case Page::Ai:
+      break;
+  }
+  updateRgb();
+}
+
+void applyPrinterStatus(JsonObjectConst status) {
+  if (!status["webhooks"].isNull()) {
+    printer.klippyState = status["webhooks"]["state"] | printer.klippyState;
+  }
+  if (!status["print_stats"].isNull()) {
+    printer.printState = status["print_stats"]["state"] | printer.printState;
+    printer.filename = String(status["print_stats"]["filename"] | printer.filename.c_str());
+    printer.printDuration = status["print_stats"]["print_duration"] | printer.printDuration;
+  }
+  if (!status["extruder"].isNull()) {
+    printer.nozzleTemperature = status["extruder"]["temperature"] | printer.nozzleTemperature;
+    printer.nozzleTarget = status["extruder"]["target"] | printer.nozzleTarget;
+  }
+  if (!status["heater_bed"].isNull()) {
+    printer.bedTemperature = status["heater_bed"]["temperature"] | printer.bedTemperature;
+    printer.bedTarget = status["heater_bed"]["target"] | printer.bedTarget;
+  }
+  if (!status["virtual_sdcard"].isNull()) {
+    printer.progress = status["virtual_sdcard"]["progress"] | printer.progress;
+  }
+  if (!status["display_status"].isNull()) {
+    printer.message = String(status["display_status"]["message"] | printer.message.c_str());
+  }
+  if (!status["gcode_move"].isNull()) {
+    const float speedFactor = status["gcode_move"]["speed_factor"] | (printer.speedPercent / 100.0f);
+    const float flowFactor = status["gcode_move"]["extrude_factor"] | (printer.flowPercent / 100.0f);
+    printer.speedPercent = constrain(static_cast<int>(lroundf(speedFactor * 100)), 1, 999);
+    printer.flowPercent = constrain(static_cast<int>(lroundf(flowFactor * 100)), 1, 999);
+  }
+  const JsonObjectConst switchSensor = status["filament_switch_sensor sfs_switch"];
+  const JsonObjectConst motionSensor = status["filament_motion_sensor sfs_motion"];
+  if (!switchSensor.isNull() || !motionSensor.isNull()) {
+    printer.hasFilamentSensors = true;
+    if (!switchSensor.isNull()) {
+      printer.filamentPresent = switchSensor["filament_detected"] | printer.filamentPresent;
+    }
+    if (!motionSensor.isNull()) {
+      printer.filamentMoving = motionSensor["filament_detected"] | printer.filamentMoving;
+    }
+  }
+  if (!status["temperature_sensor btt_eddy_mcu"].isNull()) {
+    printer.eddyTemperature =
+        status["temperature_sensor btt_eddy_mcu"]["temperature"] | printer.eddyTemperature;
+  }
+  printer.online = true;
+}
+
+void sendSubscription() {
+  JsonDocument request;
+  request["jsonrpc"] = "2.0";
+  request["method"] = "printer.objects.subscribe";
+  request["id"] = 1;
+  JsonObject objects = request["params"]["objects"].to<JsonObject>();
+  objects["webhooks"].to<JsonArray>().add("state");
+  JsonArray printStats = objects["print_stats"].to<JsonArray>();
+  printStats.add("state");
+  printStats.add("filename");
+  printStats.add("print_duration");
+  JsonArray virtualSd = objects["virtual_sdcard"].to<JsonArray>();
+  virtualSd.add("progress");
+  JsonArray extruder = objects["extruder"].to<JsonArray>();
+  extruder.add("temperature");
+  extruder.add("target");
+  JsonArray bed = objects["heater_bed"].to<JsonArray>();
+  bed.add("temperature");
+  bed.add("target");
+  JsonArray displayStatus = objects["display_status"].to<JsonArray>();
+  displayStatus.add("progress");
+  displayStatus.add("message");
+  JsonArray gcodeMove = objects["gcode_move"].to<JsonArray>();
+  gcodeMove.add("speed_factor");
+  gcodeMove.add("extrude_factor");
+  objects["filament_switch_sensor sfs_switch"].to<JsonArray>().add("filament_detected");
+  objects["filament_motion_sensor sfs_motion"].to<JsonArray>().add("filament_detected");
+  objects["temperature_sensor btt_eddy_mcu"].to<JsonArray>().add("temperature");
+
+  String payload;
+  serializeJson(request, payload);
+  moonrakerSocket.sendTXT(payload);
+}
+
+void handleSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    socketConnected = true;
+    sendSubscription();
+    return;
+  }
+  if (type == WStype_DISCONNECTED) {
+    socketConnected = false;
+    return;
+  }
+  if (type != WStype_TEXT) return;
+
+  JsonDocument document;
+  if (deserializeJson(document, payload, length)) return;
+  JsonObjectConst status;
+  const String method = String(document["method"] | "");
+  if (method == "notify_status_update") {
+    status = document["params"][0].as<JsonObjectConst>();
+  } else if (!document["result"]["status"].isNull()) {
+    status = document["result"]["status"].as<JsonObjectConst>();
+  } else if (method == "notify_klippy_ready") {
+    sendSubscription();
+    return;
+  }
+  if (!status.isNull()) {
+    applyPrinterStatus(status);
+    refreshActivePage();
+  }
+}
+
+void startMoonrakerSocket() {
+  if (strlen(MOONRAKER_API_KEY) > 0) {
+    socketHeaders = String("X-Api-Key: ") + MOONRAKER_API_KEY + "\r\n";
+    moonrakerSocket.setExtraHeaders(socketHeaders.c_str());
+  }
+  moonrakerSocket.begin(MOONRAKER_HOST, MOONRAKER_PORT, "/websocket");
+  moonrakerSocket.onEvent(handleSocketEvent);
+  moonrakerSocket.setReconnectInterval(5000);
+  moonrakerSocket.enableHeartbeat(15000, 3000, 2);
+}
+
+bool postMoonraker(const String &path) {
+  if (WiFi.status() != WL_CONNECTED || !printer.online) return false;
+  WiFiClient client;
+  HTTPClient http;
+  const String endpoint = String("http://") + MOONRAKER_HOST + ":" + MOONRAKER_PORT + path;
+  http.setConnectTimeout(1500);
+  http.setTimeout(2000);
+  if (!http.begin(client, endpoint)) return false;
+  if (strlen(MOONRAKER_API_KEY) > 0) http.addHeader("X-Api-Key", MOONRAKER_API_KEY);
+  const int statusCode = http.POST("");
+  http.end();
+  return statusCode >= 200 && statusCode < 300;
+}
+
 bool pollMoonraker() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -562,6 +841,7 @@ bool pollMoonraker() {
   const String endpoint = String("http://") + MOONRAKER_HOST + ":" + MOONRAKER_PORT +
       "/printer/objects/query?webhooks&print_stats&virtual_sdcard&"
       "extruder=temperature,target&heater_bed=temperature,target&display_status=progress,message&"
+      "gcode_move=speed_factor,extrude_factor&"
       "filament_switch_sensor%20sfs_switch=filament_detected&"
       "filament_motion_sensor%20sfs_motion=filament_detected&"
       "temperature_sensor%20btt_eddy_mcu=temperature";
@@ -585,23 +865,7 @@ bool pollMoonraker() {
   JsonObject status = document["result"]["status"];
   if (status.isNull()) return false;
 
-  printer.online = true;
-  printer.klippyState = status["webhooks"]["state"] | "unknown";
-  printer.printState = status["print_stats"]["state"] | "standby";
-  printer.filename = String(status["print_stats"]["filename"] | "");
-  printer.printDuration = status["print_stats"]["print_duration"] | 0.0f;
-  printer.nozzleTemperature = status["extruder"]["temperature"] | 0.0f;
-  printer.nozzleTarget = status["extruder"]["target"] | 0.0f;
-  printer.bedTemperature = status["heater_bed"]["temperature"] | 0.0f;
-  printer.bedTarget = status["heater_bed"]["target"] | 0.0f;
-  printer.progress = status["virtual_sdcard"]["progress"] | 0.0f;
-  printer.message = String(status["display_status"]["message"] | "");
-  const JsonObject switchSensor = status["filament_switch_sensor sfs_switch"];
-  const JsonObject motionSensor = status["filament_motion_sensor sfs_motion"];
-  printer.hasFilamentSensors = !switchSensor.isNull() || !motionSensor.isNull();
-  printer.filamentPresent = switchSensor["filament_detected"] | false;
-  printer.filamentMoving = motionSensor["filament_detected"] | false;
-  printer.eddyTemperature = status["temperature_sensor btt_eddy_mcu"]["temperature"] | 0.0f;
+  applyPrinterStatus(status);
   return true;
 }
 
@@ -630,12 +894,14 @@ void setup() {
   render(true);
 
   connectWifi();
+  startMoonrakerSocket();
   drawStaticLayout();
   render(true);
 }
 
 void loop() {
   const unsigned long now = millis();
+  moonrakerSocket.loop();
 
   if (WiFi.status() != WL_CONNECTED && now - lastWifiAttemptAt >= kWifiRetryMs) {
     lastWifiAttemptAt = now;
@@ -645,7 +911,7 @@ void loop() {
     updateRgb();
   }
 
-  if (now - lastPollAt >= kPollIntervalMs) {
+  if (!socketConnected && now - lastPollAt >= kFallbackPollIntervalMs) {
     lastPollAt = now;
     if (!pollMoonraker()) printer.online = false;
     if (activePage == Page::Dashboard) {
