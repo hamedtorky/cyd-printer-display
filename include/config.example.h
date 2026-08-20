@@ -11,3 +11,4 @@
 // an OpenAI API key; it only talks to this local service.
 #define AI_GATEWAY_HOST "printer.lan"
 #define AI_GATEWAY_PORT 8787
+#define AI_GATEWAY_TOKEN ""

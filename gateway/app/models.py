@@ -38,4 +38,9 @@ class Health(BaseModel):
     provider: str
     model: str
     analysis_available: bool
+    analysis_running: bool = False
 
+
+class AnalysisStart(BaseModel):
+    accepted: bool
+    status: Literal["started", "running"]

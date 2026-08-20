@@ -11,6 +11,16 @@
 
 #include "config.h"
 
+#ifndef AI_GATEWAY_HOST
+#define AI_GATEWAY_HOST "printer.lan"
+#endif
+#ifndef AI_GATEWAY_PORT
+#define AI_GATEWAY_PORT 8787
+#endif
+#ifndef AI_GATEWAY_TOKEN
+#define AI_GATEWAY_TOKEN ""
+#endif
+
 namespace {
 
 constexpr uint16_t kBlack = TFT_BLACK;
@@ -34,6 +44,7 @@ constexpr int kLedGreen = 16;
 constexpr int kLedBlue = 17;
 constexpr int kNavigationTop = 207;
 constexpr unsigned long kCancelHoldMs = 2000;
+constexpr unsigned long kAiPollIntervalMs = 5000;
 
 TFT_eSPI display;
 SPIClass touchSpi(VSPI);
@@ -43,6 +54,7 @@ Preferences preferences;
 unsigned long lastPollAt = 0;
 unsigned long lastWifiAttemptAt = 0;
 unsigned long lastInteractionAt = 0;
+unsigned long lastAiPollAt = 0;
 bool socketConnected = false;
 String socketHeaders;
 
@@ -120,7 +132,32 @@ struct ControlSnapshot {
 ControlSnapshot shownControls;
 String controlMessage;
 
+struct AiAssessment {
+  bool gatewayOnline = false;
+  bool available = false;
+  bool analyzing = false;
+  String status = "unknown";
+  String summary;
+  String recommendation;
+  String analyzedAt;
+  int confidencePercent = 0;
+};
+
+struct AiSnapshot {
+  bool gatewayOnline = false;
+  bool available = false;
+  bool analyzing = false;
+  String status;
+  String summary;
+  String recommendation;
+  int confidencePercent = -1;
+};
+
+AiAssessment aiAssessment;
+AiSnapshot shownAi;
+
 bool postMoonraker(const String &path);
+bool requestAiAnalysis();
 
 String shorten(const String &value, size_t maximum) {
   if (value.length() <= maximum) return value;
@@ -441,15 +478,76 @@ void updateControlValues(bool force = false) {
   }
 }
 
-void renderAi() {
+void drawAiLayout() {
   drawPageTitle("AI ASSISTANT");
+  display.drawRoundRect(12, 163, 296, 36, 7, kYellow);
+  shownAi = AiSnapshot{};
+}
+
+void drawWrappedText(const String &text, int x, int y, int widthChars, int maxLines,
+                     uint16_t color) {
+  String remaining = text;
+  display.setTextDatum(TL_DATUM);
+  display.setTextColor(color, kBlack);
+  for (int line = 0; line < maxLines && !remaining.isEmpty(); ++line) {
+    int take = min(static_cast<int>(remaining.length()), widthChars);
+    if (take < static_cast<int>(remaining.length())) {
+      const int space = remaining.substring(0, take + 1).lastIndexOf(' ');
+      if (space > widthChars / 2) take = space;
+    }
+    display.drawString(remaining.substring(0, take), x, y + line * 18, 2);
+    remaining = remaining.substring(take);
+    remaining.trim();
+  }
+}
+
+void renderAi(bool force = false) {
+  const bool changed = force || aiAssessment.gatewayOnline != shownAi.gatewayOnline ||
+                       aiAssessment.available != shownAi.available ||
+                       aiAssessment.analyzing != shownAi.analyzing ||
+                       aiAssessment.status != shownAi.status ||
+                       aiAssessment.summary != shownAi.summary ||
+                       aiAssessment.recommendation != shownAi.recommendation ||
+                       aiAssessment.confidencePercent != shownAi.confidencePercent;
+  if (!changed) return;
+
+  display.fillRect(10, 46, 300, 112, kBlack);
   display.setTextDatum(MC_DATUM);
-  display.setTextColor(kWhite, kBlack);
-  display.drawString("Cloud analysis gateway", 160, 80, 2);
+  if (!aiAssessment.gatewayOnline) {
+    display.setTextColor(kRed, kBlack);
+    display.drawString("GATEWAY OFFLINE", 160, 78, 4);
+    display.setTextColor(kWhite, kBlack);
+    display.drawString("Start the service on the CM4", 160, 111, 2);
+  } else if (aiAssessment.analyzing) {
+    display.setTextColor(kYellow, kBlack);
+    display.drawString("ANALYZING...", 160, 82, 4);
+    display.setTextColor(kWhite, kBlack);
+    display.drawString("The display remains responsive", 160, 119, 2);
+  } else if (!aiAssessment.available) {
+    display.setTextColor(kWhite, kBlack);
+    display.drawString("No assessment yet", 160, 78, 4);
+    display.drawString("Tap below to inspect the print", 160, 117, 2);
+  } else {
+    const uint16_t statusColor = aiAssessment.status == "critical" ? kRed
+                                 : aiAssessment.status == "warning" ? kYellow
+                                                                     : kWhite;
+    display.setTextColor(statusColor, kBlack);
+    display.drawString(aiAssessment.status + "  " + aiAssessment.confidencePercent + "%", 160,
+                       57, 4);
+    drawWrappedText(aiAssessment.summary, 14, 81, 45, 2, kWhite);
+    drawWrappedText(aiAssessment.recommendation, 14, 119, 45, 2, kYellow);
+  }
+  display.fillRect(14, 165, 292, 32, kBlack);
+  display.setTextDatum(MC_DATUM);
   display.setTextColor(kYellow, kBlack);
-  display.drawString("Not configured yet", 160, 111, 4);
-  display.setTextColor(kWhite, kBlack);
-  display.drawString("Advice only - never automatic control", 160, 155, 2);
+  display.drawString(aiAssessment.analyzing ? "ANALYSIS RUNNING" : "ANALYZE NOW", 160, 181, 2);
+  shownAi.gatewayOnline = aiAssessment.gatewayOnline;
+  shownAi.available = aiAssessment.available;
+  shownAi.analyzing = aiAssessment.analyzing;
+  shownAi.status = aiAssessment.status;
+  shownAi.summary = aiAssessment.summary;
+  shownAi.recommendation = aiAssessment.recommendation;
+  shownAi.confidencePercent = aiAssessment.confidencePercent;
 }
 
 void redrawActivePage() {
@@ -468,7 +566,8 @@ void redrawActivePage() {
       updateControlValues(true);
       break;
     case Page::Ai:
-      renderAi();
+      drawAiLayout();
+      renderAi(true);
       break;
   }
 }
@@ -580,6 +679,7 @@ void handleTouch() {
     const Page selected = static_cast<Page>(constrain(x / 80, 0, 3));
     if (selected != activePage) {
       activePage = selected;
+      if (activePage == Page::Ai) lastAiPollAt = 0;
       redrawActivePage();
     }
   }
@@ -628,6 +728,16 @@ void handleTouch() {
       const bool ok = postMoonraker("/printer/print/cancel");
       controlMessage = ok ? "Print cancel requested" : "Failed to cancel print";
       updateControlValues(true);
+    }
+  }
+  if (activePage == Page::Ai && isTouched && !wasTouched && !wasSleeping && y >= 163 && y <= 199) {
+    if (!aiAssessment.analyzing) {
+      aiAssessment.analyzing = true;
+      renderAi();
+      if (!requestAiAnalysis()) {
+        aiAssessment.analyzing = false;
+        renderAi();
+      }
     }
   }
   wasTouched = isTouched;
@@ -692,6 +802,7 @@ void refreshActivePage() {
       updateControlValues();
       break;
     case Page::Ai:
+      renderAi();
       break;
   }
   updateRgb();
@@ -833,6 +944,66 @@ bool postMoonraker(const String &path) {
   return statusCode >= 200 && statusCode < 300;
 }
 
+void addGatewayToken(HTTPClient &http) {
+  if (strlen(AI_GATEWAY_TOKEN) > 0) http.addHeader("X-Display-Token", AI_GATEWAY_TOKEN);
+}
+
+bool requestAiAnalysis() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient client;
+  HTTPClient http;
+  const String endpoint = String("http://") + AI_GATEWAY_HOST + ":" + AI_GATEWAY_PORT +
+                          "/v1/analyze/start";
+  http.setConnectTimeout(1200);
+  http.setTimeout(1800);
+  if (!http.begin(client, endpoint)) return false;
+  addGatewayToken(http);
+  const int statusCode = http.POST("");
+  http.end();
+  aiAssessment.gatewayOnline = statusCode > 0;
+  return statusCode == HTTP_CODE_ACCEPTED;
+}
+
+bool pollAiAssessment() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient client;
+  HTTPClient http;
+  const String endpoint = String("http://") + AI_GATEWAY_HOST + ":" + AI_GATEWAY_PORT +
+                          "/v1/assessment";
+  http.setConnectTimeout(1000);
+  http.setTimeout(1500);
+  if (!http.begin(client, endpoint)) return false;
+  addGatewayToken(http);
+  const int statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK) {
+    http.end();
+    aiAssessment.gatewayOnline = statusCode > 0;
+    return false;
+  }
+
+  JsonDocument document;
+  const DeserializationError error = deserializeJson(document, http.getStream());
+  http.end();
+  if (error) return false;
+  aiAssessment.gatewayOnline = true;
+  if (document.isNull()) {
+    aiAssessment.available = false;
+    return true;
+  }
+
+  const String newAnalyzedAt = String(document["analyzed_at"] | "");
+  const bool isNewAssessment = !newAnalyzedAt.isEmpty() && newAnalyzedAt != aiAssessment.analyzedAt;
+  aiAssessment.available = true;
+  aiAssessment.status = String(document["status"] | "unknown");
+  aiAssessment.summary = String(document["summary"] | "No summary returned");
+  aiAssessment.recommendation = String(document["recommendation"] | "Inspect the printer manually");
+  aiAssessment.confidencePercent =
+      constrain(static_cast<int>(lroundf((document["confidence"] | 0.0f) * 100)), 0, 100);
+  aiAssessment.analyzedAt = newAnalyzedAt;
+  if (isNewAssessment) aiAssessment.analyzing = false;
+  return true;
+}
+
 bool pollMoonraker() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -920,6 +1091,13 @@ void loop() {
       renderHealth();
     }
     updateRgb();
+  }
+
+  if ((activePage == Page::Ai || aiAssessment.analyzing) &&
+      now - lastAiPollAt >= kAiPollIntervalMs) {
+    lastAiPollAt = now;
+    if (!pollAiAssessment()) aiAssessment.gatewayOnline = false;
+    if (activePage == Page::Ai) renderAi();
   }
 
   handleTouch();

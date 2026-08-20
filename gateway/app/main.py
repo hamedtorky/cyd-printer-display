@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from .analyzers import Analyzer, create_analyzer
 from .config import Settings
-from .models import Assessment, Health
+from .models import AnalysisStart, Assessment, Health
 from .sources import SourceError, fetch_camera, fetch_telemetry
 
 
@@ -22,9 +22,47 @@ class GatewayState:
         self.latest: Assessment | None = None
         self.last_started_at = 0.0
         self.lock = asyncio.Lock()
+        self.task: asyncio.Task[None] | None = None
 
     async def close(self) -> None:
+        if self.task and not self.task.done():
+            self.task.cancel()
         await self.client.aclose()
+
+    def reserve_analysis(self) -> None:
+        now = time.monotonic()
+        retry_after = self.settings.min_analysis_interval_seconds - (now - self.last_started_at)
+        if retry_after > 0:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="analysis rate limit active",
+                headers={"Retry-After": str(max(1, int(retry_after)))},
+            )
+        self.last_started_at = now
+
+    async def perform_analysis(self) -> Assessment:
+        telemetry, (image, media_type) = await asyncio.gather(
+            fetch_telemetry(self.settings, self.client),
+            fetch_camera(self.settings, self.client),
+        )
+        assessment = await self.analyzer.analyze(image, media_type, telemetry)
+        self.latest = assessment
+        return assessment
+
+    async def perform_background_analysis(self) -> None:
+        try:
+            await self.perform_analysis()
+        except Exception as exc:
+            source = "mock" if self.settings.ai_provider == "mock" else (
+                "local" if self.settings.ai_base_url else "openai"
+            )
+            self.latest = Assessment(
+                status="unknown",
+                summary="Analysis failed",
+                recommendation=str(exc)[:180],
+                confidence=0,
+                source=source,
+            )
 
 
 def create_app(settings: Settings | None = None, analyzer: Analyzer | None = None) -> FastAPI:
@@ -51,6 +89,7 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
             provider=state_holder.settings.ai_provider,
             model=state_holder.settings.openai_model,
             analysis_available=state_holder.latest is not None,
+            analysis_running=state_holder.task is not None and not state_holder.task.done(),
         )
 
     @app.get("/v1/assessment", response_model=Assessment | None, dependencies=[Depends(authorize)])
@@ -60,23 +99,11 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
     @app.post("/v1/analyze", response_model=Assessment, dependencies=[Depends(authorize)])
     async def analyze() -> Assessment:
         async with state_holder.lock:
-            now = time.monotonic()
-            retry_after = state_holder.settings.min_analysis_interval_seconds - (
-                now - state_holder.last_started_at
-            )
-            if retry_after > 0:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="analysis rate limit active",
-                    headers={"Retry-After": str(max(1, int(retry_after)))},
-                )
-            state_holder.last_started_at = now
+            if state_holder.task and not state_holder.task.done():
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="analysis running")
+            state_holder.reserve_analysis()
             try:
-                telemetry, (image, media_type) = await asyncio.gather(
-                    fetch_telemetry(state_holder.settings, state_holder.client),
-                    fetch_camera(state_holder.settings, state_holder.client),
-                )
-                assessment = await state_holder.analyzer.analyze(image, media_type, telemetry)
+                assessment = await state_holder.perform_analysis()
             except SourceError as exc:
                 raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
             except Exception as exc:
@@ -84,8 +111,21 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail=f"analysis provider failed: {exc}",
                 ) from exc
-            state_holder.latest = assessment
             return assessment
+
+    @app.post(
+        "/v1/analyze/start",
+        response_model=AnalysisStart,
+        status_code=status.HTTP_202_ACCEPTED,
+        dependencies=[Depends(authorize)],
+    )
+    async def start_analysis() -> AnalysisStart:
+        async with state_holder.lock:
+            if state_holder.task and not state_holder.task.done():
+                return AnalysisStart(accepted=False, status="running")
+            state_holder.reserve_analysis()
+            state_holder.task = asyncio.create_task(state_holder.perform_background_analysis())
+            return AnalysisStart(accepted=True, status="started")
 
     return app
 

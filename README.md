@@ -1,51 +1,93 @@
 # CYD Printer Display
 
-Read-only Klipper status display for the ESP32-2432S028R Cheap Yellow Display.
+Touchscreen Klipper cockpit and optional cloud print-quality assistant for the
+ESP32-2432S028R Cheap Yellow Display.
 
 ![CYD Printer Display showing live Klipper status](image/image_1.png)
 
-The firmware polls Moonraker every 1.5 seconds and displays:
+## Features
 
-- Klipper and print state
-- Nozzle and bed actual/target temperatures
-- Current filename
-- Print progress
-- Elapsed print time
-- Wi-Fi signal and Moonraker connection state
+- Flicker-free partial redraws on a black, white, red, and yellow interface
+- Moonraker WebSocket updates with automatic REST fallback
+- Dashboard for state, temperatures, filename, progress, and elapsed time
+- Health page for Wi-Fi, Moonraker, BTT SFS V2.0, and BTT Eddy temperature
+- Touch controls for pause/resume, speed, and flow during an active print
+- Two-second hold confirmation before canceling a print
+- RGB status LED: white ready, yellow printing, blue paused, red alert/offline
+- Automatic backlight dimming, sleep, and touch-to-wake
+- Optional camera analysis through a separate CM4/OpenAI gateway
 
-The interface uses a black, white, red, and yellow theme. Static labels and
-frames are drawn once; each dynamic region is redrawn only when its displayed
-value changes, avoiding full-screen refresh flicker.
+The AI is advisory only. It cannot send G-code, move axes, change heaters, or
+cancel a print.
 
-It does not send G-code or printer-control requests.
+## Architecture
 
-## Network setup
+```text
+CYD ESP32 <--WebSocket/HTTP--> Moonraker
+    |
+    +------HTTP------> CM4 AI gateway ----> OpenAI Responses API
+                           |                     (optional)
+                           +----> Crowsnest snapshot
+                           +----> Moonraker telemetry
+```
 
-Wi-Fi credentials are not compiled into the firmware. On first boot, the screen
-shows `Printer-Display-Setup`. Join that temporary Wi-Fi network from a phone or
-computer, open `192.168.4.1`, and select the Wi-Fi network used by the printer.
-The ESP32 stores those credentials locally.
+The OpenAI API key remains in the gateway's environment on the CM4. It is never
+stored on the ESP32. See [gateway setup](gateway/README.md) for mock mode,
+OpenAI configuration, limits, and future local-model support.
 
-The default Moonraker address in `include/config.h` is `printer.lan:7125`. If
-local DNS does not resolve that name, use `192.168.1.138` for `MOONRAKER_HOST`.
+## Firmware configuration
 
-If Moonraker requires authentication, set `MOONRAKER_API_KEY`. Leave it empty
-when the display is on a trusted local network.
+Copy `include/config.example.h` to the ignored `include/config.h`, then adjust:
 
-## Build
+```cpp
+#define MOONRAKER_HOST "printer.lan"
+#define MOONRAKER_PORT 7125
+#define MOONRAKER_API_KEY ""
+
+#define AI_GATEWAY_HOST "printer.lan"
+#define AI_GATEWAY_PORT 8787
+#define AI_GATEWAY_TOKEN ""
+```
+
+Wi-Fi credentials are not compiled into the firmware. On first boot, join
+`Printer-Display-Setup`, open `192.168.4.1`, and select the printer Wi-Fi.
+
+## Touch calibration
+
+The first boot shows two calibration targets. Touch their centers with a
+stylus. Calibration is saved in ESP32 NVS. To recalibrate, hold the touchscreen
+while powering or resetting the display.
+
+The first touch after screen sleep only wakes the backlight; it never activates
+a control.
+
+## Build and upload
 
 ```sh
 pio run
-```
-
-## Upload
-
-The confirmed CYD serial port on this Mac is `/dev/cu.usbserial-13140`.
-
-```sh
 pio run --target upload
 pio device monitor
 ```
 
-Uploading replaces the firmware currently stored on the ESP32. Building does
-not modify the device.
+The confirmed CYD serial port on this Mac is `/dev/cu.usbserial-13140`.
+Building does not modify the device. Uploading replaces its firmware and starts
+the touchscreen calibration flow.
+
+## Safety model
+
+- Status and AI features are read-only.
+- Speed and flow are limited to 50-200% and 50-150%, respectively.
+- Speed and flow buttons work only while Moonraker reports an active print.
+- Pause/resume is available only in the matching print state.
+- Cancel requires a continuous two-second hold.
+- No automatic action is taken from an AI assessment.
+
+## Development tests
+
+```sh
+pio run
+cd gateway
+python3 -m venv .venv
+.venv/bin/pip install -e '.[test]'
+.venv/bin/pytest -q
+```

@@ -76,3 +76,9 @@ def test_optional_display_token() -> None:
             "/v1/assessment", headers={"X-Display-Token": "secret"}
         ).status_code == 200
 
+
+def test_background_analysis_start() -> None:
+    with build_client() as client:
+        response = client.post("/v1/analyze/start")
+        assert response.status_code == 202
+        assert response.json() == {"accepted": True, "status": "started"}
