@@ -1,9 +1,12 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
+#include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <XPT2046_Touchscreen.h>
 
 #include "config.h"
 
@@ -15,10 +18,41 @@ constexpr uint16_t kRed = TFT_RED;
 constexpr uint16_t kYellow = TFT_YELLOW;
 constexpr unsigned long kPollIntervalMs = 1500;
 constexpr unsigned long kWifiRetryMs = 10000;
+constexpr unsigned long kDimAfterMs = 60000;
+constexpr unsigned long kSleepAfterMs = 300000;
+constexpr uint8_t kBacklightChannel = 0;
+constexpr uint8_t kBacklightBright = 255;
+constexpr uint8_t kBacklightDim = 55;
+constexpr int kTouchCs = 33;
+constexpr int kTouchIrq = 36;
+constexpr int kTouchClk = 25;
+constexpr int kTouchMosi = 32;
+constexpr int kTouchMiso = 39;
+constexpr int kLedRed = 4;
+constexpr int kLedGreen = 16;
+constexpr int kLedBlue = 17;
+constexpr int kNavigationTop = 207;
 
 TFT_eSPI display;
+SPIClass touchSpi(VSPI);
+XPT2046_Touchscreen touch(kTouchCs, kTouchIrq);
+Preferences preferences;
 unsigned long lastPollAt = 0;
 unsigned long lastWifiAttemptAt = 0;
+unsigned long lastInteractionAt = 0;
+
+enum class Page : uint8_t { Dashboard, Health, Controls, Ai };
+Page activePage = Page::Dashboard;
+
+struct TouchCalibration {
+  int32_t left = 0;
+  int32_t right = 0;
+  int32_t top = 0;
+  int32_t bottom = 0;
+  bool valid = false;
+};
+
+TouchCalibration touchCalibration;
 
 struct PrinterStatus {
   bool online = false;
@@ -32,6 +66,10 @@ struct PrinterStatus {
   float bedTarget = 0;
   float progress = 0;
   float printDuration = 0;
+  bool filamentPresent = false;
+  bool filamentMoving = false;
+  bool hasFilamentSensors = false;
+  float eddyTemperature = 0;
 };
 
 PrinterStatus printer;
@@ -52,6 +90,17 @@ struct DisplaySnapshot {
 };
 
 DisplaySnapshot shown;
+
+struct HealthSnapshot {
+  String connection;
+  String wifi;
+  String filament;
+  String eddy;
+  String message;
+  uint16_t headerColor = 0;
+};
+
+HealthSnapshot shownHealth;
 
 String shorten(const String &value, size_t maximum) {
   if (value.length() <= maximum) return value;
@@ -92,6 +141,41 @@ String wifiLabel() {
   return String(quantizedRssi) + " dBm";
 }
 
+void setBacklight(uint8_t brightness) { ledcWrite(kBacklightChannel, brightness); }
+
+void setRgb(bool red, bool green, bool blue) {
+  // The CYD RGB LED is active-low.
+  digitalWrite(kLedRed, red ? LOW : HIGH);
+  digitalWrite(kLedGreen, green ? LOW : HIGH);
+  digitalWrite(kLedBlue, blue ? LOW : HIGH);
+}
+
+void updateRgb() {
+  if (!printer.online || printer.klippyState != "ready" || printer.printState == "error") {
+    setRgb(true, false, false);
+  } else if (printer.printState == "printing") {
+    setRgb(true, true, false);
+  } else if (printer.printState == "paused") {
+    setRgb(false, false, true);
+  } else {
+    setRgb(true, true, true);
+  }
+}
+
+void drawNavigation() {
+  static const char *labels[] = {"HOME", "HEALTH", "CONTROL", "AI"};
+  display.fillRect(0, kNavigationTop, 320, 33, kBlack);
+  for (int i = 0; i < 4; ++i) {
+    const bool selected = static_cast<int>(activePage) == i;
+    const int x = i * 80;
+    display.fillRect(x + 1, kNavigationTop + 1, 78, 31, selected ? kYellow : kBlack);
+    display.drawRect(x, kNavigationTop, 80, 33, selected ? kYellow : kWhite);
+    display.setTextColor(selected ? kBlack : kWhite, selected ? kYellow : kBlack);
+    display.setTextDatum(MC_DATUM);
+    display.drawString(labels[i], x + 40, kNavigationTop + 16, 2);
+  }
+}
+
 void drawStaticLayout() {
   display.fillScreen(kBlack);
 
@@ -108,12 +192,8 @@ void drawStaticLayout() {
 
   display.drawRoundRect(9, 167, 302, 20, 6, kWhite);
 
-  display.setTextColor(kYellow, kBlack);
-  display.drawString("ELAPSED", 10, 199, 2);
-  display.setTextDatum(TR_DATUM);
-  display.drawString("MOONRAKER", 310, 199, 2);
-
   shown = DisplaySnapshot{};
+  drawNavigation();
 }
 
 void drawTemperatureValue(int x, int actual, int target) {
@@ -184,22 +264,256 @@ void render(bool force = false) {
   }
 
   if (force || elapsed != shown.elapsed) {
-    display.fillRect(8, 214, 105, 23, kBlack);
+    display.fillRect(8, 190, 105, 16, kBlack);
     display.setTextDatum(TL_DATUM);
     display.setTextColor(kWhite, kBlack);
-    display.drawString(elapsed, 10, 217, 2);
+    display.drawString(elapsed, 10, 191, 2);
     shown.elapsed = elapsed;
   }
 
   if (force || connection != shown.connection) {
-    display.fillRect(175, 214, 137, 23, kBlack);
+    display.fillRect(175, 190, 137, 16, kBlack);
     display.setTextDatum(TR_DATUM);
     display.setTextColor(printer.online ? kYellow : kRed, kBlack);
-    display.drawString(connection, 310, 217, 2);
+    display.drawString(connection, 310, 191, 2);
     shown.connection = connection;
   }
 
   shown.initialized = true;
+}
+
+void drawPageTitle(const char *title) {
+  display.fillScreen(kBlack);
+  display.fillRect(0, 0, 320, 38, stateColor());
+  const uint16_t background = stateColor();
+  display.setTextColor(background == kRed ? kWhite : kBlack, background);
+  display.setTextDatum(ML_DATUM);
+  display.drawString(title, 10, 19, 4);
+  drawNavigation();
+}
+
+void drawHealthLayout() {
+  drawPageTitle("PRINTER HEALTH");
+  display.setTextDatum(TL_DATUM);
+  display.setTextColor(kYellow, kBlack);
+  display.drawString("CONNECTION", 12, 50, 2);
+  display.drawString("FILAMENT", 12, 91, 2);
+  display.drawString("EDDY", 12, 148, 2);
+  shownHealth = HealthSnapshot{};
+}
+
+void renderHealth(bool force = false) {
+  const String connection = printer.online ? "Moonraker connected" : "Moonraker disconnected";
+  const String wifi = wifiLabel();
+  String filament = "Sensor data unavailable";
+  if (printer.hasFilamentSensors) {
+    filament = String("Present: ") + (printer.filamentPresent ? "YES" : "NO") +
+               "     Motion: " + (printer.filamentMoving ? "YES" : "NO");
+  }
+  char eddy[40];
+  snprintf(eddy, sizeof(eddy), "MCU temperature: %.1f C", printer.eddyTemperature);
+  const String eddyText(eddy);
+  const String message = shorten(printer.message, 42);
+  const uint16_t headerColor = stateColor();
+
+  if (force || headerColor != shownHealth.headerColor) {
+    display.fillRect(0, 0, 320, 38, headerColor);
+    display.setTextColor(headerColor == kRed ? kWhite : kBlack, headerColor);
+    display.setTextDatum(ML_DATUM);
+    display.drawString("PRINTER HEALTH", 10, 19, 4);
+    shownHealth.headerColor = headerColor;
+  }
+  display.setTextDatum(TL_DATUM);
+  if (force || connection != shownHealth.connection || wifi != shownHealth.wifi) {
+    display.fillRect(10, 67, 300, 18, kBlack);
+    display.setTextColor(kWhite, kBlack);
+    display.drawString(connection, 12, 68, 2);
+    display.setTextDatum(TR_DATUM);
+    display.drawString(wifi, 308, 68, 2);
+    display.setTextDatum(TL_DATUM);
+    shownHealth.connection = connection;
+    shownHealth.wifi = wifi;
+  }
+  if (force || filament != shownHealth.filament) {
+    display.fillRect(10, 109, 300, 20, kBlack);
+    display.setTextColor(printer.hasFilamentSensors && !printer.filamentPresent ? kRed : kWhite,
+                         kBlack);
+    display.drawString(filament, 12, 110, 2);
+    shownHealth.filament = filament;
+  }
+  if (force || eddyText != shownHealth.eddy) {
+    display.fillRect(10, 166, 300, 18, kBlack);
+    display.setTextColor(kWhite, kBlack);
+    display.drawString(eddyText, 12, 167, 2);
+    shownHealth.eddy = eddyText;
+  }
+  if (force || message != shownHealth.message) {
+    display.fillRect(10, 186, 300, 18, kBlack);
+    if (!message.isEmpty()) {
+      display.setTextColor(kRed, kBlack);
+      display.drawString(message, 12, 188, 2);
+    }
+    shownHealth.message = message;
+  }
+}
+
+void renderControls() {
+  drawPageTitle("SAFE CONTROLS");
+  display.setTextDatum(MC_DATUM);
+  display.setTextColor(kWhite, kBlack);
+  display.drawString("Controls will unlock after", 160, 82, 2);
+  display.drawString("Moonraker command safety is enabled.", 160, 106, 2);
+  display.setTextColor(kYellow, kBlack);
+  display.drawString("No commands sent in this build", 160, 151, 2);
+}
+
+void renderAi() {
+  drawPageTitle("AI ASSISTANT");
+  display.setTextDatum(MC_DATUM);
+  display.setTextColor(kWhite, kBlack);
+  display.drawString("Cloud analysis gateway", 160, 80, 2);
+  display.setTextColor(kYellow, kBlack);
+  display.drawString("Not configured yet", 160, 111, 4);
+  display.setTextColor(kWhite, kBlack);
+  display.drawString("Advice only - never automatic control", 160, 155, 2);
+}
+
+void redrawActivePage() {
+  shown = DisplaySnapshot{};
+  switch (activePage) {
+    case Page::Dashboard:
+      drawStaticLayout();
+      render(true);
+      break;
+    case Page::Health:
+      drawHealthLayout();
+      renderHealth(true);
+      break;
+    case Page::Controls:
+      renderControls();
+      break;
+    case Page::Ai:
+      renderAi();
+      break;
+  }
+}
+
+TS_Point waitForCalibrationTouch() {
+  while (touch.touched()) delay(10);
+  while (!touch.touched()) delay(10);
+  int32_t x = 0;
+  int32_t y = 0;
+  int samples = 0;
+  while (touch.touched() && samples < 40) {
+    const TS_Point point = touch.getPoint();
+    x += point.x;
+    y += point.y;
+    ++samples;
+    delay(8);
+  }
+  return TS_Point(x / max(samples, 1), y / max(samples, 1), 1);
+}
+
+TS_Point captureCalibrationPoint(int x, int y, const char *label) {
+  display.fillScreen(kBlack);
+  display.setTextDatum(MC_DATUM);
+  display.setTextColor(kWhite, kBlack);
+  display.drawString(label, 160, 110, 2);
+  display.drawCircle(x, y, 10, kYellow);
+  display.drawLine(x - 14, y, x + 14, y, kYellow);
+  display.drawLine(x, y - 14, x, y + 14, kYellow);
+  return waitForCalibrationTouch();
+}
+
+void calibrateTouch() {
+  const TS_Point topLeft = captureCalibrationPoint(24, 24, "Touch the top-left target");
+  delay(250);
+  const TS_Point bottomRight = captureCalibrationPoint(296, 216, "Touch the bottom-right target");
+
+  touchCalibration.left = topLeft.x;
+  touchCalibration.right = bottomRight.x;
+  touchCalibration.top = topLeft.y;
+  touchCalibration.bottom = bottomRight.y;
+  touchCalibration.valid = abs(touchCalibration.right - touchCalibration.left) > 500 &&
+                           abs(touchCalibration.bottom - touchCalibration.top) > 500;
+  if (!touchCalibration.valid) {
+    display.fillScreen(kBlack);
+    display.setTextDatum(MC_DATUM);
+    display.setTextColor(kRed, kBlack);
+    display.drawString("Calibration failed - try again", 160, 120, 2);
+    delay(1500);
+    calibrateTouch();
+    return;
+  }
+
+  preferences.begin("cyd-touch", false);
+  preferences.putInt("left", touchCalibration.left);
+  preferences.putInt("right", touchCalibration.right);
+  preferences.putInt("top", touchCalibration.top);
+  preferences.putInt("bottom", touchCalibration.bottom);
+  preferences.putBool("valid", true);
+  preferences.end();
+}
+
+void initializeTouch() {
+  touchSpi.begin(kTouchClk, kTouchMiso, kTouchMosi, kTouchCs);
+  touch.begin(touchSpi);
+  touch.setRotation(1);
+
+  preferences.begin("cyd-touch", true);
+  touchCalibration.left = preferences.getInt("left", 0);
+  touchCalibration.right = preferences.getInt("right", 0);
+  touchCalibration.top = preferences.getInt("top", 0);
+  touchCalibration.bottom = preferences.getInt("bottom", 0);
+  touchCalibration.valid = preferences.getBool("valid", false);
+  preferences.end();
+
+  // Holding the screen during boot deliberately starts calibration again.
+  const unsigned long started = millis();
+  bool held = false;
+  while (millis() - started < 1200) {
+    if (touch.touched()) held = true;
+    delay(10);
+  }
+  if (!touchCalibration.valid || held) calibrateTouch();
+}
+
+bool readTouch(int &screenX, int &screenY) {
+  if (!touchCalibration.valid || !touch.touched()) return false;
+  const TS_Point point = touch.getPoint();
+  const float xScale = 272.0f / static_cast<float>(touchCalibration.right - touchCalibration.left);
+  const float yScale = 192.0f / static_cast<float>(touchCalibration.bottom - touchCalibration.top);
+  screenX = constrain(static_cast<int>(24 + (point.x - touchCalibration.left) * xScale), 0, 319);
+  screenY = constrain(static_cast<int>(24 + (point.y - touchCalibration.top) * yScale), 0, 239);
+  return true;
+}
+
+void handleTouch() {
+  static bool wasTouched = false;
+  int x = 0;
+  int y = 0;
+  const bool isTouched = readTouch(x, y);
+  if (isTouched) {
+    lastInteractionAt = millis();
+    setBacklight(kBacklightBright);
+  }
+  if (isTouched && !wasTouched && y >= kNavigationTop) {
+    const Page selected = static_cast<Page>(constrain(x / 80, 0, 3));
+    if (selected != activePage) {
+      activePage = selected;
+      redrawActivePage();
+    }
+  }
+  wasTouched = isTouched;
+}
+
+void updateBacklight() {
+  const unsigned long idleFor = millis() - lastInteractionAt;
+  if (idleFor >= kSleepAfterMs) {
+    setBacklight(0);
+  } else if (idleFor >= kDimAfterMs) {
+    setBacklight(kBacklightDim);
+  }
 }
 
 void renderSetupPortal() {
@@ -247,7 +561,10 @@ bool pollMoonraker() {
   HTTPClient http;
   const String endpoint = String("http://") + MOONRAKER_HOST + ":" + MOONRAKER_PORT +
       "/printer/objects/query?webhooks&print_stats&virtual_sdcard&"
-      "extruder=temperature,target&heater_bed=temperature,target&display_status=progress,message";
+      "extruder=temperature,target&heater_bed=temperature,target&display_status=progress,message&"
+      "filament_switch_sensor%20sfs_switch=filament_detected&"
+      "filament_motion_sensor%20sfs_motion=filament_detected&"
+      "temperature_sensor%20btt_eddy_mcu=temperature";
 
   http.setConnectTimeout(1200);
   http.setTimeout(1200);
@@ -279,6 +596,12 @@ bool pollMoonraker() {
   printer.bedTarget = status["heater_bed"]["target"] | 0.0f;
   printer.progress = status["virtual_sdcard"]["progress"] | 0.0f;
   printer.message = String(status["display_status"]["message"] | "");
+  const JsonObject switchSensor = status["filament_switch_sensor sfs_switch"];
+  const JsonObject motionSensor = status["filament_motion_sensor sfs_motion"];
+  printer.hasFilamentSensors = !switchSensor.isNull() || !motionSensor.isNull();
+  printer.filamentPresent = switchSensor["filament_detected"] | false;
+  printer.filamentMoving = motionSensor["filament_detected"] | false;
+  printer.eddyTemperature = status["temperature_sensor btt_eddy_mcu"]["temperature"] | 0.0f;
   return true;
 }
 
@@ -286,8 +609,13 @@ bool pollMoonraker() {
 
 void setup() {
   Serial.begin(115200);
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
+  ledcSetup(kBacklightChannel, 5000, 8);
+  ledcAttachPin(TFT_BL, kBacklightChannel);
+  setBacklight(kBacklightBright);
+  pinMode(kLedRed, OUTPUT);
+  pinMode(kLedGreen, OUTPUT);
+  pinMode(kLedBlue, OUTPUT);
+  setRgb(false, false, false);
 
   display.init();
   display.setRotation(1);
@@ -296,6 +624,8 @@ void setup() {
   // first command immediately after initialization.
   display.invertDisplay(true);
   display.setTextWrap(false);
+  initializeTouch();
+  lastInteractionAt = millis();
   drawStaticLayout();
   render(true);
 
@@ -311,14 +641,23 @@ void loop() {
     lastWifiAttemptAt = now;
     WiFi.reconnect();
     printer.online = false;
-    render();
+    if (activePage == Page::Dashboard) render();
+    updateRgb();
   }
 
   if (now - lastPollAt >= kPollIntervalMs) {
     lastPollAt = now;
     if (!pollMoonraker()) printer.online = false;
-    render();
+    if (activePage == Page::Dashboard) {
+      render();
+    } else if (activePage == Page::Health) {
+      renderHealth();
+    }
+    updateRgb();
   }
+
+  handleTouch();
+  updateBacklight();
 
   delay(20);
 }
