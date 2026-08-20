@@ -291,6 +291,10 @@ void setup() {
 
   display.init();
   display.setRotation(1);
+  // This CYD panel requires the ILI9341 inversion command for normal colors.
+  // Calling the runtime API sends the command twice for panels that ignore the
+  // first command immediately after initialization.
+  display.invertDisplay(true);
   display.setTextWrap(false);
   drawStaticLayout();
   render(true);
