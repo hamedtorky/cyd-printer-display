@@ -5,10 +5,11 @@ import hashlib
 import secrets
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 
 from .analyzers import Analyzer, create_analyzer
 from .config import Settings
@@ -131,6 +132,48 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
                 "X-Preview-Height": str(PREVIEW_HEIGHT),
                 "Cache-Control": "no-store",
             },
+        )
+
+    def firmware_files() -> tuple[Path, Path]:
+        directory = Path(state_holder.settings.firmware_dir)
+        return directory / "firmware.bin", directory / "version.txt"
+
+    @app.get("/v1/firmware/manifest", dependencies=[Depends(authorize)])
+    async def firmware_manifest() -> dict[str, str | int]:
+        image_path, version_path = firmware_files()
+        if not image_path.is_file() or not version_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="OTA firmware is not published"
+            )
+        version = version_path.read_text(encoding="utf-8").strip()
+        if not version or len(version) > 32:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="invalid OTA firmware version",
+            )
+        image_size = image_path.stat().st_size
+        digest = await asyncio.to_thread(
+            lambda: hashlib.sha256(image_path.read_bytes()).hexdigest()
+        )
+        return {
+            "version": version,
+            "size": image_size,
+            "sha256": digest,
+            "path": "/v1/firmware/image",
+        }
+
+    @app.get("/v1/firmware/image", dependencies=[Depends(authorize)])
+    async def firmware_image() -> FileResponse:
+        image_path, _ = firmware_files()
+        if not image_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="OTA firmware is not published"
+            )
+        return FileResponse(
+            image_path,
+            media_type="application/octet-stream",
+            filename="cyd-printer-display.bin",
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.post("/v1/analyze", response_model=Assessment, dependencies=[Depends(authorize)])

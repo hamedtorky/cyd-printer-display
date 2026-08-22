@@ -24,6 +24,8 @@ ESP32-2432S028R Cheap Yellow Display.
   manual 25 mm retract/extrude at 10 mm/s
 - RGB status LED: white ready, yellow printing, blue paused, red alert/offline
 - Automatic backlight dimming, sleep, and touch-to-wake
+- Wi-Fi firmware updates from the CM4 with version checking, SHA-256 integrity
+  verification, idle-only installation, and hold-to-confirm
 - Optional camera analysis through a separate CM4/OpenAI gateway
 
 The AI is advisory only. It cannot send G-code, move axes, change heaters, or
@@ -83,6 +85,26 @@ The confirmed CYD serial port on this Mac is `/dev/cu.usbserial-11310`.
 Building does not modify the device. Uploading replaces its firmware and starts
 the touchscreen calibration flow.
 
+## Wi-Fi firmware updates
+
+Firmware v0.4.0 and later can update over Wi-Fi using the existing ESP32 OTA
+bootloader partitions. USB remains available as the recovery path.
+
+For a future release, update `CYD_FIRMWARE_VERSION` in
+`include/firmware_version.h`, then publish the build to the CM4:
+
+```sh
+tools/publish_ota.sh
+```
+
+The script builds the firmware and atomically uploads the binary and version to
+`hamed@192.168.1.138`. Override `OTA_REMOTE` or `OTA_REMOTE_DIR` when needed.
+
+The display checks the manifest after connecting to Wi-Fi. Open **HEALTH** to
+see the result. When a newer version is available and the printer is idle, hold
+the update button for two seconds. The ESP downloads into the inactive OTA
+partition, verifies the complete SHA-256 digest, activates it, and restarts.
+
 ## Safety model
 
 - Status and AI features are read-only.
@@ -94,6 +116,10 @@ the touchscreen calibration flow.
   feedrate.
 - Live Z-offset adjustment uses 0.025 mm steps and is limited to +/-2 mm.
 - The display does not expose `SAVE_CONFIG`, which could restart Klipper.
+- OTA installation is blocked while a print is active or paused and always
+  requires a continuous two-second hold.
+- A downloaded firmware image is not activated unless its size and SHA-256
+  digest match the CM4 manifest.
 - No automatic action is taken from an AI assessment.
 
 ## Development tests

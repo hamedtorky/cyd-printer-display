@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import httpx
 from fastapi.testclient import TestClient
+from pathlib import Path
 
 from app.analyzers import MockAnalyzer
 from app.config import Settings
@@ -44,12 +45,13 @@ def camera_response(_: httpx.Request) -> httpx.Response:
     return httpx.Response(200, content=b"fake-jpeg", headers={"content-type": "image/jpeg"})
 
 
-def build_client(token: str = "") -> TestClient:
+def build_client(token: str = "", firmware_dir: str = "/missing-firmware") -> TestClient:
     settings = Settings(
         gateway_token=token,
         min_analysis_interval_seconds=10,
         moonraker_url="http://moonraker",
         camera_snapshot_url="http://camera/snapshot",
+        firmware_dir=firmware_dir,
     )
     app = create_app(settings, MockAnalyzer())
     transport = httpx.MockTransport(
@@ -102,3 +104,21 @@ def test_model_preview_is_rgb565() -> None:
         assert response.headers["x-preview-width"] == "220"
         assert response.headers["x-preview-height"] == "145"
         assert len(response.content) == 220 * 145 * 2
+
+
+def test_ota_manifest_and_image(tmp_path: Path) -> None:
+    firmware = b"test-esp32-firmware"
+    (tmp_path / "firmware.bin").write_bytes(firmware)
+    (tmp_path / "version.txt").write_text("0.4.0\n", encoding="utf-8")
+    with build_client(firmware_dir=str(tmp_path)) as client:
+        manifest = client.get("/v1/firmware/manifest")
+        assert manifest.status_code == 200
+        assert manifest.json() == {
+            "version": "0.4.0",
+            "size": len(firmware),
+            "sha256": "32d893f7584744edc9f241f37070f763e61d590a0007c8ddc0dfde33de16ec78",
+            "path": "/v1/firmware/image",
+        }
+        image = client.get("/v1/firmware/image")
+        assert image.status_code == 200
+        assert image.content == firmware

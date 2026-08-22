@@ -4,12 +4,15 @@
 #include <Preferences.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
+#include <Update.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <WebSocketsClient.h>
 #include <XPT2046_Touchscreen.h>
+#include <mbedtls/sha256.h>
 
 #include "config.h"
+#include "firmware_version.h"
 
 #ifndef AI_GATEWAY_HOST
 #define AI_GATEWAY_HOST "printer.lan"
@@ -65,9 +68,24 @@ bool modelPreviewReady = false;
 String modelPreviewFilename;
 String modelPreviewError;
 unsigned long lastPreviewAttemptAt = 0;
+bool otaBootCheckDone = false;
 
 enum class Page : uint8_t { Dashboard, Model, Health, Toolhead, Extruder, Ai };
 Page activePage = Page::Dashboard;
+
+enum class OtaState : uint8_t { Unchecked, Checking, Current, Available, Failed };
+
+struct OtaInfo {
+  OtaState state = OtaState::Unchecked;
+  String version;
+  String sha256;
+  String message;
+  size_t size = 0;
+};
+
+OtaInfo ota;
+bool otaHoldArmed = false;
+unsigned long otaHoldStartedAt = 0;
 
 struct TouchCalibration {
   int32_t left = 0;
@@ -129,7 +147,7 @@ struct HealthSnapshot {
   String wifi;
   String filament;
   String eddy;
-  String message;
+  String ota;
   uint16_t headerColor = 0;
 };
 
@@ -192,6 +210,9 @@ AiSnapshot shownAi;
 bool postMoonraker(const String &path);
 bool requestAiAnalysis();
 bool fetchModelPreview();
+bool printerIdleForOta();
+bool checkForOtaUpdate();
+bool performOtaUpdate();
 
 String shorten(const String &value, size_t maximum) {
   if (value.length() <= maximum) return value;
@@ -402,9 +423,10 @@ void drawHealthLayout() {
   drawPageTitle("PRINTER HEALTH");
   display.setTextDatum(TL_DATUM);
   display.setTextColor(kYellow, kBlack);
-  display.drawString("CONNECTION", 12, 50, 2);
-  display.drawString("FILAMENT", 12, 91, 2);
-  display.drawString("EDDY", 12, 148, 2);
+  display.drawString("CONNECTION", 12, 44, 2);
+  display.drawString("FILAMENT", 12, 82, 2);
+  display.drawString("EDDY", 12, 120, 2);
+  display.drawRoundRect(10, 162, 300, 37, 6, kYellow);
   shownHealth = HealthSnapshot{};
 }
 
@@ -447,7 +469,26 @@ void renderHealth(bool force = false) {
   char eddy[40];
   snprintf(eddy, sizeof(eddy), "MCU temperature: %.1f C", printer.eddyTemperature);
   const String eddyText(eddy);
-  const String message = shorten(printer.message, 42);
+  const bool activePrint = printer.printState == "printing" || printer.printState == "paused";
+  String otaText;
+  uint16_t otaColor = kYellow;
+  if (otaHoldArmed) {
+    otaText = "KEEP HOLDING TO UPDATE";
+  } else if (ota.state == OtaState::Checking) {
+    otaText = "CHECKING FOR UPDATE...";
+  } else if (ota.state == OtaState::Current) {
+    otaText = String("UP TO DATE  v") + CYD_FIRMWARE_VERSION;
+    otaColor = kWhite;
+  } else if (ota.state == OtaState::Available) {
+    otaText = activePrint ? "UPDATE LOCKED DURING PRINT" : String("HOLD TO INSTALL  v") + ota.version;
+    otaColor = activePrint ? kRed : kYellow;
+  } else if (ota.state == OtaState::Failed) {
+    otaText = String("RETRY UPDATE: ") + shorten(ota.message, 20);
+    otaColor = kRed;
+  } else {
+    otaText = String("CHECK UPDATE  v") + CYD_FIRMWARE_VERSION;
+  }
+  const String otaKey = String(static_cast<int>(ota.state)) + "|" + otaText;
   const uint16_t headerColor = stateColor();
 
   if (force || headerColor != shownHealth.headerColor) {
@@ -459,35 +500,34 @@ void renderHealth(bool force = false) {
   }
   display.setTextDatum(TL_DATUM);
   if (force || connection != shownHealth.connection || wifi != shownHealth.wifi) {
-    display.fillRect(10, 67, 300, 18, kBlack);
+    display.fillRect(10, 61, 300, 18, kBlack);
     display.setTextColor(kWhite, kBlack);
-    display.drawString(connection, 12, 68, 2);
+    display.drawString(connection, 12, 62, 2);
     display.setTextDatum(TR_DATUM);
-    display.drawString(wifi, 308, 68, 2);
+    display.drawString(wifi, 308, 62, 2);
     display.setTextDatum(TL_DATUM);
     shownHealth.connection = connection;
     shownHealth.wifi = wifi;
   }
   if (force || filament != shownHealth.filament) {
-    display.fillRect(10, 109, 300, 20, kBlack);
+    display.fillRect(10, 99, 300, 18, kBlack);
     display.setTextColor(printer.hasFilamentSensors && !printer.filamentPresent ? kRed : kWhite,
                          kBlack);
-    display.drawString(filament, 12, 110, 2);
+    display.drawString(filament, 12, 100, 2);
     shownHealth.filament = filament;
   }
   if (force || eddyText != shownHealth.eddy) {
-    display.fillRect(10, 166, 300, 18, kBlack);
+    display.fillRect(10, 137, 300, 18, kBlack);
     display.setTextColor(kWhite, kBlack);
-    display.drawString(eddyText, 12, 167, 2);
+    display.drawString(eddyText, 12, 138, 2);
     shownHealth.eddy = eddyText;
   }
-  if (force || message != shownHealth.message) {
-    display.fillRect(10, 186, 300, 18, kBlack);
-    if (!message.isEmpty()) {
-      display.setTextColor(kRed, kBlack);
-      display.drawString(message, 12, 188, 2);
-    }
-    shownHealth.message = message;
+  if (force || otaKey != shownHealth.ota) {
+    display.fillRect(12, 164, 296, 33, kBlack);
+    display.setTextDatum(MC_DATUM);
+    display.setTextColor(otaColor, kBlack);
+    display.drawString(otaText, 160, 180, 2);
+    shownHealth.ota = otaKey;
   }
 }
 
@@ -845,8 +885,27 @@ void handleTouch() {
     if (selected != activePage) {
       activePage = selected;
       if (activePage == Page::Ai) lastAiPollAt = 0;
+      otaHoldArmed = false;
       redrawActivePage();
     }
+  }
+  if (!isTouched && otaHoldArmed) {
+    otaHoldArmed = false;
+    if (activePage == Page::Health) renderHealth();
+  }
+  if (activePage == Page::Health && isTouched && !wasSleeping && y >= 162 && y <= 199) {
+    if (!wasTouched) {
+      if (ota.state == OtaState::Available) {
+        if (printerIdleForOta()) {
+          otaHoldArmed = true;
+          otaHoldStartedAt = millis();
+        }
+      } else {
+        checkForOtaUpdate();
+      }
+      renderHealth();
+    }
+    if (otaHoldArmed && millis() - otaHoldStartedAt >= 2000) performOtaUpdate();
   }
   if (activePage == Page::Toolhead && isTouched && !wasTouched && !wasSleeping &&
       y < kNavigationTop) {
@@ -1174,6 +1233,189 @@ void addGatewayToken(HTTPClient &http) {
   if (strlen(AI_GATEWAY_TOKEN) > 0) http.addHeader("X-Display-Token", AI_GATEWAY_TOKEN);
 }
 
+bool printerIdleForOta() {
+  return printer.klippyState == "ready" && printer.printState != "printing" &&
+         printer.printState != "paused";
+}
+
+bool parseVersion(const String &input, int parts[3]) {
+  String version = input;
+  version.trim();
+  if (version.startsWith("v")) version.remove(0, 1);
+  int start = 0;
+  for (int index = 0; index < 3; ++index) {
+    const int separator = version.indexOf('.', start);
+    const int end = index == 2 ? version.length() : separator;
+    if (end <= start || (index < 2 && separator < 0)) return false;
+    for (int cursor = start; cursor < end; ++cursor) {
+      if (!isDigit(version[cursor])) return false;
+    }
+    parts[index] = version.substring(start, end).toInt();
+    start = end + 1;
+  }
+  return start == version.length() + 1;
+}
+
+bool versionIsNewer(const String &candidate) {
+  int remote[3] = {0, 0, 0};
+  int current[3] = {0, 0, 0};
+  if (!parseVersion(candidate, remote) || !parseVersion(CYD_FIRMWARE_VERSION, current)) return false;
+  for (int index = 0; index < 3; ++index) {
+    if (remote[index] != current[index]) return remote[index] > current[index];
+  }
+  return false;
+}
+
+bool checkForOtaUpdate() {
+  ota.state = OtaState::Checking;
+  ota.message = "";
+  if (activePage == Page::Health) renderHealth();
+  if (WiFi.status() != WL_CONNECTED) {
+    ota.state = OtaState::Failed;
+    ota.message = "Wi-Fi offline";
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  const String endpoint = String("http://") + AI_GATEWAY_HOST + ":" + AI_GATEWAY_PORT +
+                          "/v1/firmware/manifest";
+  http.setConnectTimeout(2000);
+  http.setTimeout(5000);
+  if (!http.begin(client, endpoint)) {
+    ota.state = OtaState::Failed;
+    ota.message = "Gateway unavailable";
+    return false;
+  }
+  addGatewayToken(http);
+  const int statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK) {
+    ota.state = OtaState::Failed;
+    ota.message = String("HTTP ") + statusCode;
+    http.end();
+    return false;
+  }
+
+  JsonDocument document;
+  const DeserializationError error = deserializeJson(document, http.getStream());
+  http.end();
+  if (error) {
+    ota.state = OtaState::Failed;
+    ota.message = "Invalid manifest";
+    return false;
+  }
+  ota.version = String(document["version"] | "");
+  ota.sha256 = String(document["sha256"] | "");
+  ota.size = document["size"] | 0;
+  int parsed[3] = {0, 0, 0};
+  if (!parseVersion(ota.version, parsed) || ota.sha256.length() != 64 || ota.size == 0 ||
+      ota.size > ESP.getFreeSketchSpace()) {
+    ota.state = OtaState::Failed;
+    ota.message = "Invalid firmware";
+    return false;
+  }
+  ota.state = versionIsNewer(ota.version) ? OtaState::Available : OtaState::Current;
+  return true;
+}
+
+void drawOtaProgress(int percent, const String &label) {
+  display.fillScreen(kBlack);
+  display.setTextDatum(MC_DATUM);
+  display.setTextColor(kYellow, kBlack);
+  display.drawString("WI-FI FIRMWARE UPDATE", 160, 58, 4);
+  display.setTextColor(kWhite, kBlack);
+  display.drawString(label, 160, 103, 2);
+  display.drawRect(20, 132, 280, 24, kWhite);
+  display.fillRect(22, 134, 276, 20, kBlack);
+  const int width = (276 * constrain(percent, 0, 100)) / 100;
+  if (width > 0) display.fillRect(22, 134, width, 20, kYellow);
+  display.setTextColor(percent >= 52 ? kBlack : kWhite);
+  display.drawString(String(percent) + "%", 160, 144, 2);
+  display.setTextColor(kWhite, kBlack);
+  display.drawString("Do not remove display power", 160, 184, 2);
+}
+
+bool failOta(const String &message, HTTPClient *http = nullptr, bool abortUpdate = false) {
+  if (abortUpdate) Update.abort();
+  if (http) http->end();
+  ota.state = OtaState::Failed;
+  ota.message = message;
+  otaHoldArmed = false;
+  drawHealthLayout();
+  renderHealth(true);
+  return false;
+}
+
+bool performOtaUpdate() {
+  if (!printerIdleForOta()) return failOta("Printer is active");
+  drawOtaProgress(0, String("Installing v") + ota.version);
+
+  WiFiClient client;
+  HTTPClient http;
+  const String endpoint = String("http://") + AI_GATEWAY_HOST + ":" + AI_GATEWAY_PORT +
+                          "/v1/firmware/image";
+  http.setConnectTimeout(3000);
+  http.setTimeout(15000);
+  if (!http.begin(client, endpoint)) return failOta("Gateway unavailable");
+  addGatewayToken(http);
+  const int statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK || http.getSize() != static_cast<int>(ota.size)) {
+    return failOta(String("Firmware HTTP ") + statusCode, &http);
+  }
+  if (!Update.begin(ota.size, U_FLASH)) return failOta("OTA partition unavailable", &http);
+
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts_ret(&sha, 0);
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buffer[1024];
+  size_t received = 0;
+  int shownPercent = -1;
+  unsigned long lastDataAt = millis();
+  while (received < ota.size) {
+    const int available = stream->available();
+    if (available <= 0) {
+      if (millis() - lastDataAt > 10000) {
+        mbedtls_sha256_free(&sha);
+        return failOta("Firmware timeout", &http, true);
+      }
+      delay(2);
+      continue;
+    }
+    const size_t wanted = min(static_cast<size_t>(available),
+                              min(sizeof(buffer), ota.size - received));
+    const int count = stream->read(buffer, wanted);
+    if (count <= 0) continue;
+    lastDataAt = millis();
+    mbedtls_sha256_update_ret(&sha, buffer, count);
+    if (Update.write(buffer, count) != static_cast<size_t>(count)) {
+      mbedtls_sha256_free(&sha);
+      return failOta("Flash write failed", &http, true);
+    }
+    received += count;
+    const int percent = static_cast<int>((received * 100) / ota.size);
+    if (percent != shownPercent) {
+      shownPercent = percent;
+      drawOtaProgress(percent, String("Installing v") + ota.version);
+    }
+  }
+
+  uint8_t digest[32];
+  mbedtls_sha256_finish_ret(&sha, digest);
+  mbedtls_sha256_free(&sha);
+  char digestHex[65];
+  for (int index = 0; index < 32; ++index) snprintf(digestHex + index * 2, 3, "%02x", digest[index]);
+  digestHex[64] = '\0';
+  if (!ota.sha256.equalsIgnoreCase(digestHex)) return failOta("SHA-256 mismatch", &http, true);
+  if (!Update.end()) return failOta("Firmware validation failed", &http, true);
+  http.end();
+
+  drawOtaProgress(100, "Verified - restarting");
+  delay(1500);
+  ESP.restart();
+  return true;
+}
+
 bool fetchModelPreview() {
   if (WiFi.status() != WL_CONNECTED || printer.filename.isEmpty()) return false;
   WiFiClient client;
@@ -1349,6 +1591,10 @@ void loop() {
   const unsigned long now = millis();
   moonrakerSocket.loop();
   refreshModelPreviewIfNeeded(now);
+  if (!otaBootCheckDone && WiFi.status() == WL_CONNECTED && now >= 10000) {
+    otaBootCheckDone = true;
+    checkForOtaUpdate();
+  }
 
   if (WiFi.status() != WL_CONNECTED && now - lastWifiAttemptAt >= kWifiRetryMs) {
     lastWifiAttemptAt = now;

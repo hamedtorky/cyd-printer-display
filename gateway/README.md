@@ -11,6 +11,11 @@ When none exists, it renders visible extrusion paths. The result is cached as a
 220x145 RGB565 image, so the ESP downloads it once per filename without needing
 new firmware.
 
+The same service hosts ESP firmware updates. `/v1/firmware/manifest` reports
+the published semantic version, size, and SHA-256 digest, while
+`/v1/firmware/image` streams the binary. Firmware files are published
+atomically by `tools/publish_ota.sh` from the repository root.
+
 ## Install on the CM4
 
 Do this while the printer is idle. The Python environment uses approximately
@@ -43,6 +48,7 @@ Run it interactively for the first test:
 .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8787
 curl http://127.0.0.1:8787/health
 curl -o /tmp/model-preview.rgb http://127.0.0.1:8787/v1/model-preview
+curl http://127.0.0.1:8787/v1/firmware/manifest
 curl -X POST http://127.0.0.1:8787/v1/analyze
 ```
 
@@ -64,6 +70,10 @@ sudo systemctl enable --now cyd-printer-ai.service
 - Active G-code downloads are read-only and limited by `MAX_GCODE_BYTES`
   (100 MB by default).
 - Generated previews are cached until the active filename changes.
+- OTA firmware is read from `FIRMWARE_DIR`; binaries and temporary publishing
+  files are excluded from Git.
+- OTA endpoints use the same optional `X-Display-Token` authorization as the
+  display and AI endpoints.
 - OpenAI requests use structured output, low-detail images, and `store=False`.
 - The ESP32 uses the asynchronous `/v1/analyze/start` route and remains
   responsive while analysis runs.

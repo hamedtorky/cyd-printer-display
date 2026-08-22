@@ -17,6 +17,7 @@ class Settings:
     min_analysis_interval_seconds: int = 60
     max_image_bytes: int = 5_000_000
     max_gcode_bytes: int = 100_000_000
+    firmware_dir: str = "/home/hamed/cyd-printer-display/gateway/firmware"
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -36,4 +37,7 @@ class Settings:
             ),
             max_image_bytes=max(100_000, int(os.getenv("MAX_IMAGE_BYTES", "5000000"))),
             max_gcode_bytes=max(1_000_000, int(os.getenv("MAX_GCODE_BYTES", "100000000"))),
+            firmware_dir=os.getenv(
+                "FIRMWARE_DIR", "/home/hamed/cyd-printer-display/gateway/firmware"
+            ),
         )
