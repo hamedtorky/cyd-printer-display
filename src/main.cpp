@@ -99,8 +99,7 @@ struct DisplaySnapshot {
   String state;
   String wifi;
   String job;
-  String elapsed;
-  String connection;
+  String remaining;
   int nozzleTemperature = -999;
   int nozzleTarget = -999;
   int bedTemperature = -999;
@@ -184,6 +183,12 @@ String formatDuration(float seconds) {
   return String(buffer);
 }
 
+String estimatedRemaining() {
+  if (printer.progress < 0.005f || printer.printDuration <= 0) return "--:--";
+  const float estimatedTotal = printer.printDuration / printer.progress;
+  return formatDuration(max(0.0f, estimatedTotal - printer.printDuration));
+}
+
 uint16_t stateColor() {
   if (!printer.online || printer.klippyState != "ready") return kRed;
   if (printer.printState == "printing") return kYellow;
@@ -248,38 +253,37 @@ void drawNavigation() {
 void drawStaticLayout() {
   display.fillScreen(kBlack);
 
-  display.drawRoundRect(8, 48, 148, 61, 8, kYellow);
-  display.drawRoundRect(164, 48, 148, 61, 8, kYellow);
+  // HOME uses 70% of the content width for the model and 30% for live status.
+  display.drawRect(3, 41, kModelPreviewWidth + 2, kModelPreviewHeight + 2, kYellow);
+  display.pushImage(4, 42, kModelPreviewWidth, kModelPreviewHeight, kModelPreview);
+  display.drawRoundRect(228, 41, 89, 163, 6, kWhite);
   display.setTextDatum(TL_DATUM);
   display.setTextColor(kYellow, kBlack);
-  display.drawString("NOZZLE", 18, 55, 2);
-  display.drawString("BED", 174, 55, 2);
+  display.drawString("NOZZLE", 234, 47, 2);
+  display.drawString("BED", 234, 78, 2);
+  display.drawString("PROGRESS", 234, 109, 2);
+  display.drawString("TIME LEFT", 234, 158, 2);
 
-  display.drawRoundRect(8, 117, 304, 42, 8, kWhite);
-  display.setTextColor(kWhite, kBlack);
-  display.drawString("JOB", 18, 123, 2);
-
-  display.drawRoundRect(9, 167, 302, 20, 6, kWhite);
+  display.drawRect(234, 140, 76, 10, kWhite);
 
   shown = DisplaySnapshot{};
   drawNavigation();
 }
 
-void drawTemperatureValue(int x, int actual, int target) {
-  display.fillRect(x + 4, 73, 140, 31, kBlack);
+void drawCompactTemperature(int y, int actual, int target) {
+  display.fillRect(233, y, 79, 17, kBlack);
   char value[24];
-  snprintf(value, sizeof(value), "%d / %d C", actual, target);
-  display.setTextDatum(TL_DATUM);
+  snprintf(value, sizeof(value), "%d/%d C", actual, target);
+  display.setTextDatum(TR_DATUM);
   display.setTextColor(kWhite, kBlack);
-  display.drawString(value, x + 10, 77, 4);
+  display.drawString(value, 310, y, 2);
 }
 
 void render(bool force = false) {
   const String state = shorten(visibleState(), 24);
   const String wifi = wifiLabel();
-  const String job = printer.filename.isEmpty() ? "No active file" : shorten(printer.filename, 39);
-  const String elapsed = formatDuration(printer.printDuration);
-  const String connection = printer.online ? "CONNECTED" : "DISCONNECTED";
+  const String job = printer.filename.isEmpty() ? "No active file" : shorten(printer.filename, 29);
+  const String remaining = estimatedRemaining();
   const int nozzleTemperature = lroundf(printer.nozzleTemperature);
   const int nozzleTarget = lroundf(printer.nozzleTarget);
   const int bedTemperature = lroundf(printer.bedTemperature);
@@ -301,51 +305,44 @@ void render(bool force = false) {
   }
 
   if (force || nozzleTemperature != shown.nozzleTemperature || nozzleTarget != shown.nozzleTarget) {
-    drawTemperatureValue(8, nozzleTemperature, nozzleTarget);
+    drawCompactTemperature(62, nozzleTemperature, nozzleTarget);
     shown.nozzleTemperature = nozzleTemperature;
     shown.nozzleTarget = nozzleTarget;
   }
 
   if (force || bedTemperature != shown.bedTemperature || bedTarget != shown.bedTarget) {
-    drawTemperatureValue(164, bedTemperature, bedTarget);
+    drawCompactTemperature(93, bedTemperature, bedTarget);
     shown.bedTemperature = bedTemperature;
     shown.bedTarget = bedTarget;
   }
 
   if (force || job != shown.job) {
-    display.fillRect(12, 136, 296, 19, kBlack);
+    display.fillRect(3, 189, 221, 16, kBlack);
     display.setTextDatum(TL_DATUM);
     display.setTextColor(kWhite, kBlack);
-    display.drawString(job, 18, 140, 2);
+    display.drawString(job, 4, 190, 2);
     shown.job = job;
   }
 
   if (force || progressPercent != shown.progressPercent) {
-    display.fillRect(11, 169, 298, 16, kBlack);
-    const int fillWidth = (296 * progressPercent) / 100;
-    if (fillWidth > 0) display.fillRect(12, 170, fillWidth, 14, kYellow);
+    display.fillRect(233, 124, 79, 15, kBlack);
+    display.fillRect(235, 141, 74, 8, kBlack);
+    const int fillWidth = (74 * progressPercent) / 100;
+    if (fillWidth > 0) display.fillRect(235, 141, fillWidth, 8, kYellow);
     char percent[8];
     snprintf(percent, sizeof(percent), "%d%%", progressPercent);
-    display.setTextDatum(MC_DATUM);
-    display.setTextColor(progressPercent >= 52 ? kBlack : kWhite);
-    display.drawString(percent, 160, 177, 2);
+    display.setTextDatum(TR_DATUM);
+    display.setTextColor(kWhite, kBlack);
+    display.drawString(percent, 310, 124, 2);
     shown.progressPercent = progressPercent;
   }
 
-  if (force || elapsed != shown.elapsed) {
-    display.fillRect(8, 190, 105, 16, kBlack);
-    display.setTextDatum(TL_DATUM);
-    display.setTextColor(kWhite, kBlack);
-    display.drawString(elapsed, 10, 191, 2);
-    shown.elapsed = elapsed;
-  }
-
-  if (force || connection != shown.connection) {
-    display.fillRect(175, 190, 137, 16, kBlack);
+  if (force || remaining != shown.remaining) {
+    display.fillRect(233, 175, 79, 24, kBlack);
     display.setTextDatum(TR_DATUM);
-    display.setTextColor(printer.online ? kYellow : kRed, kBlack);
-    display.drawString(connection, 310, 191, 2);
-    shown.connection = connection;
+    display.setTextColor(printer.printState == "printing" ? kYellow : kWhite, kBlack);
+    display.drawString(remaining, 310, 176, 4);
+    shown.remaining = remaining;
   }
 
   shown.initialized = true;
@@ -1110,7 +1107,7 @@ void setup() {
 
   connectWifi();
   startMoonrakerSocket();
-  activePage = Page::Model;
+  activePage = Page::Dashboard;
   redrawActivePage();
 }
 
