@@ -10,6 +10,7 @@
 #include <XPT2046_Touchscreen.h>
 
 #include "config.h"
+#include "current_model_preview.h"
 
 #ifndef AI_GATEWAY_HOST
 #define AI_GATEWAY_HOST "printer.lan"
@@ -58,7 +59,7 @@ unsigned long lastAiPollAt = 0;
 bool socketConnected = false;
 String socketHeaders;
 
-enum class Page : uint8_t { Dashboard, Health, Controls, Ai };
+enum class Page : uint8_t { Dashboard, Model, Health, Controls, Ai };
 Page activePage = Page::Dashboard;
 
 struct TouchCalibration {
@@ -131,6 +132,14 @@ struct ControlSnapshot {
 
 ControlSnapshot shownControls;
 String controlMessage;
+
+struct ModelSnapshot {
+  String filename;
+  String state;
+  int progressPercent = -1;
+};
+
+ModelSnapshot shownModel;
 
 struct AiAssessment {
   bool gatewayOnline = false;
@@ -223,16 +232,16 @@ void updateRgb() {
 }
 
 void drawNavigation() {
-  static const char *labels[] = {"HOME", "HEALTH", "CONTROL", "AI"};
+  static const char *labels[] = {"HOME", "MODEL", "HEALTH", "CTRL", "AI"};
   display.fillRect(0, kNavigationTop, 320, 33, kBlack);
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < 5; ++i) {
     const bool selected = static_cast<int>(activePage) == i;
-    const int x = i * 80;
-    display.fillRect(x + 1, kNavigationTop + 1, 78, 31, selected ? kYellow : kBlack);
-    display.drawRect(x, kNavigationTop, 80, 33, selected ? kYellow : kWhite);
+    const int x = i * 64;
+    display.fillRect(x + 1, kNavigationTop + 1, 62, 31, selected ? kYellow : kBlack);
+    display.drawRect(x, kNavigationTop, 64, 33, selected ? kYellow : kWhite);
     display.setTextColor(selected ? kBlack : kWhite, selected ? kYellow : kBlack);
     display.setTextDatum(MC_DATUM);
-    display.drawString(labels[i], x + 40, kNavigationTop + 16, 2);
+    display.drawString(labels[i], x + 32, kNavigationTop + 16, 2);
   }
 }
 
@@ -360,6 +369,34 @@ void drawHealthLayout() {
   display.drawString("FILAMENT", 12, 91, 2);
   display.drawString("EDDY", 12, 148, 2);
   shownHealth = HealthSnapshot{};
+}
+
+void drawModelLayout() {
+  drawPageTitle("PRINT MODEL");
+  display.drawRect(49, 41, kModelPreviewWidth + 2, kModelPreviewHeight + 2, kYellow);
+  display.pushImage(50, 42, kModelPreviewWidth, kModelPreviewHeight, kModelPreview);
+  shownModel = ModelSnapshot{};
+}
+
+void renderModel(bool force = false) {
+  const String filename = printer.filename.isEmpty() ? "Current G-code preview"
+                                                      : shorten(printer.filename, 31);
+  const int progressPercent = constrain(static_cast<int>(printer.progress * 100 + 0.5f), 0, 100);
+  const String state = printer.printState;
+  if (!force && filename == shownModel.filename && progressPercent == shownModel.progressPercent &&
+      state == shownModel.state) {
+    return;
+  }
+  display.fillRect(6, 190, 308, 16, kBlack);
+  display.setTextDatum(TL_DATUM);
+  display.setTextColor(kWhite, kBlack);
+  display.drawString(filename, 8, 191, 2);
+  display.setTextDatum(TR_DATUM);
+  display.setTextColor(state == "printing" ? kYellow : kWhite, kBlack);
+  display.drawString(String(progressPercent) + "%", 312, 191, 2);
+  shownModel.filename = filename;
+  shownModel.progressPercent = progressPercent;
+  shownModel.state = state;
 }
 
 void renderHealth(bool force = false) {
@@ -557,6 +594,10 @@ void redrawActivePage() {
       drawStaticLayout();
       render(true);
       break;
+    case Page::Model:
+      drawModelLayout();
+      renderModel(true);
+      break;
     case Page::Health:
       drawHealthLayout();
       renderHealth(true);
@@ -676,7 +717,7 @@ void handleTouch() {
     setBacklight(kBacklightBright);
   }
   if (isTouched && !wasTouched && !wasSleeping && y >= kNavigationTop) {
-    const Page selected = static_cast<Page>(constrain(x / 80, 0, 3));
+    const Page selected = static_cast<Page>(constrain(x / 64, 0, 4));
     if (selected != activePage) {
       activePage = selected;
       if (activePage == Page::Ai) lastAiPollAt = 0;
@@ -794,6 +835,9 @@ void refreshActivePage() {
   switch (activePage) {
     case Page::Dashboard:
       render();
+      break;
+    case Page::Model:
+      renderModel();
       break;
     case Page::Health:
       renderHealth();
@@ -1066,8 +1110,8 @@ void setup() {
 
   connectWifi();
   startMoonrakerSocket();
-  drawStaticLayout();
-  render(true);
+  activePage = Page::Model;
+  redrawActivePage();
 }
 
 void loop() {
@@ -1087,6 +1131,8 @@ void loop() {
     if (!pollMoonraker()) printer.online = false;
     if (activePage == Page::Dashboard) {
       render();
+    } else if (activePage == Page::Model) {
+      renderModel();
     } else if (activePage == Page::Health) {
       renderHealth();
     }
