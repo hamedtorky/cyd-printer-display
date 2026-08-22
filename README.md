@@ -4,7 +4,7 @@ Touchscreen Klipper cockpit and optional cloud print-quality assistant for the
 ESP32-2432S028R Cheap Yellow Display.
 
 <p align="center">
-  <img src="image/image_1.png" alt="CYD Printer Display dashboard" width="48%">
+  <img src="image/image_3.png" alt="CYD Printer Display dashboard" width="48%">
   <img src="image/image_2_rotated.png" alt="CYD Printer Display model preview" width="48%">
 </p>
 
