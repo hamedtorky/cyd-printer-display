@@ -44,7 +44,6 @@ constexpr int kLedRed = 4;
 constexpr int kLedGreen = 16;
 constexpr int kLedBlue = 17;
 constexpr int kNavigationTop = 207;
-constexpr unsigned long kCancelHoldMs = 2000;
 constexpr unsigned long kAiPollIntervalMs = 5000;
 
 TFT_eSPI display;
@@ -59,7 +58,7 @@ unsigned long lastAiPollAt = 0;
 bool socketConnected = false;
 String socketHeaders;
 
-enum class Page : uint8_t { Dashboard, Model, Health, Controls, Ai };
+enum class Page : uint8_t { Dashboard, Model, Health, Toolhead, Extruder, Ai };
 Page activePage = Page::Dashboard;
 
 struct TouchCalibration {
@@ -88,6 +87,13 @@ struct PrinterStatus {
   bool filamentMoving = false;
   bool hasFilamentSensors = false;
   float eddyTemperature = 0;
+  float positionX = 0;
+  float positionY = 0;
+  float positionZ = 0;
+  float zOffset = 0;
+  float pressureAdvance = 0;
+  float smoothTime = 0;
+  String homedAxes;
   int speedPercent = 100;
   int flowPercent = 100;
 };
@@ -121,16 +127,27 @@ struct HealthSnapshot {
 
 HealthSnapshot shownHealth;
 
-struct ControlSnapshot {
-  String action;
-  String state;
+struct ToolheadSnapshot {
+  String position;
+  String homedAxes;
+  String zOffset;
   String message;
   int speedPercent = -1;
+};
+
+ToolheadSnapshot shownToolhead;
+String toolheadMessage;
+
+struct ExtruderSnapshot {
+  String temperature;
+  String pressureAdvance;
+  String smoothTime;
+  String message;
   int flowPercent = -1;
 };
 
-ControlSnapshot shownControls;
-String controlMessage;
+ExtruderSnapshot shownExtruder;
+String extruderMessage;
 
 struct ModelSnapshot {
   String filename;
@@ -237,16 +254,18 @@ void updateRgb() {
 }
 
 void drawNavigation() {
-  static const char *labels[] = {"HOME", "MODEL", "HEALTH", "CTRL", "AI"};
+  static const char *labels[] = {"HOME", "MODEL", "HEALTH", "TOOL", "EXT", "AI"};
   display.fillRect(0, kNavigationTop, 320, 33, kBlack);
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < 6; ++i) {
     const bool selected = static_cast<int>(activePage) == i;
-    const int x = i * 64;
-    display.fillRect(x + 1, kNavigationTop + 1, 62, 31, selected ? kYellow : kBlack);
-    display.drawRect(x, kNavigationTop, 64, 33, selected ? kYellow : kWhite);
+    const int x = (i * 320) / 6;
+    const int nextX = ((i + 1) * 320) / 6;
+    const int width = nextX - x;
+    display.fillRect(x + 1, kNavigationTop + 1, width - 2, 31, selected ? kYellow : kBlack);
+    display.drawRect(x, kNavigationTop, width, 33, selected ? kYellow : kWhite);
     display.setTextColor(selected ? kBlack : kWhite, selected ? kYellow : kBlack);
     display.setTextDatum(MC_DATUM);
-    display.drawString(labels[i], x + 32, kNavigationTop + 16, 2);
+    display.drawString(labels[i], x + width / 2, kNavigationTop + 16, 1);
   }
 }
 
@@ -451,64 +470,150 @@ void renderHealth(bool force = false) {
   }
 }
 
-void renderControls() {
-  drawPageTitle("SAFE CONTROLS");
+void drawButton(int x, int y, int width, int height, const String &label,
+                uint16_t color = kWhite) {
+  display.drawRoundRect(x, y, width, height, 5, color);
   display.setTextDatum(MC_DATUM);
-  display.drawRoundRect(10, 48, 145, 42, 7, kYellow);
-  display.drawRoundRect(165, 48, 145, 42, 7, kRed);
-  display.setTextColor(kYellow, kBlack);
-  display.drawString("SPEED", 46, 112, 2);
-  display.drawString("FLOW", 46, 158, 2);
-  display.drawRoundRect(102, 98, 43, 38, 6, kWhite);
-  display.drawRoundRect(264, 98, 43, 38, 6, kWhite);
-  display.drawRoundRect(102, 144, 43, 38, 6, kWhite);
-  display.drawRoundRect(264, 144, 43, 38, 6, kWhite);
-  display.setTextColor(kWhite, kBlack);
-  display.drawString("-", 123, 117, 4);
-  display.drawString("+", 285, 117, 4);
-  display.drawString("-", 123, 163, 4);
-  display.drawString("+", 285, 163, 4);
-  shownControls = ControlSnapshot{};
+  display.setTextColor(color, kBlack);
+  display.drawString(label, x + width / 2, y + height / 2, 2);
 }
 
-void updateControlValues(bool force = false) {
-  String action = "NO ACTIVE PRINT";
-  if (printer.printState == "paused") action = "RESUME";
-  if (printer.printState == "printing") action = "PAUSE";
-  if (force || action != shownControls.action) {
-    display.fillRect(12, 50, 141, 38, kBlack);
+void drawToolheadLayout() {
+  drawPageTitle("TOOLHEAD");
+  for (int i = 0; i < 3; ++i) display.drawRoundRect(6 + i * 103, 43, 96, 33, 5, kWhite);
+  display.setTextDatum(TL_DATUM);
+  display.setTextColor(kYellow, kBlack);
+  display.drawString("X", 12, 47, 1);
+  display.drawString("Y", 115, 47, 1);
+  display.drawString("Z", 218, 47, 1);
+
+  drawButton(8, 82, 71, 29, "HOME", kYellow);
+  drawButton(84, 82, 55, 29, "S-");
+  display.drawRoundRect(144, 82, 95, 29, 5, kWhite);
+  drawButton(244, 82, 68, 29, "S+");
+  drawButton(8, 117, 70, 29, "X-");
+  drawButton(86, 117, 70, 29, "X+");
+  drawButton(164, 117, 70, 29, "Y-");
+  drawButton(242, 117, 70, 29, "Y+");
+  drawButton(8, 152, 70, 29, "Z-");
+  drawButton(86, 152, 70, 29, "Z+");
+  drawButton(164, 152, 70, 29, "OFF-");
+  drawButton(242, 152, 70, 29, "OFF+");
+  shownToolhead = ToolheadSnapshot{};
+}
+
+void renderToolhead(bool force = false) {
+  char position[72];
+  snprintf(position, sizeof(position), "%.2f|%.2f|%.3f", printer.positionX, printer.positionY,
+           printer.positionZ);
+  const String positionText(position);
+  char offset[20];
+  snprintf(offset, sizeof(offset), "Z %.3f", printer.zOffset);
+  const String offsetText(offset);
+
+  if (force || positionText != shownToolhead.position) {
+    display.setTextDatum(TR_DATUM);
+    display.setTextColor(kWhite, kBlack);
+    display.fillRect(25, 46, 73, 25, kBlack);
+    display.fillRect(128, 46, 73, 25, kBlack);
+    display.fillRect(231, 46, 73, 25, kBlack);
+    display.drawString(String(printer.positionX, 2), 96, 55, 2);
+    display.drawString(String(printer.positionY, 2), 199, 55, 2);
+    display.drawString(String(printer.positionZ, 3), 302, 55, 2);
+    shownToolhead.position = positionText;
+  }
+  if (force || printer.speedPercent != shownToolhead.speedPercent) {
+    display.fillRect(146, 84, 91, 25, kBlack);
+    display.setTextDatum(MC_DATUM);
+    display.setTextColor(kWhite, kBlack);
+    display.drawString(String(printer.speedPercent) + "%", 191, 96, 2);
+    shownToolhead.speedPercent = printer.speedPercent;
+  }
+  if (force || offsetText != shownToolhead.zOffset) {
+    display.fillRect(10, 184, 145, 19, kBlack);
+    display.setTextDatum(TL_DATUM);
     display.setTextColor(kYellow, kBlack);
-    display.setTextDatum(MC_DATUM);
-    display.drawString(action, 82, 69, 4);
-    shownControls.action = action;
+    display.drawString(offsetText, 10, 188, 2);
+    shownToolhead.zOffset = offsetText;
   }
-  if (force || printer.printState != shownControls.state) {
-    display.fillRect(167, 50, 141, 38, kBlack);
-    display.setTextColor(kRed, kBlack);
-    display.setTextDatum(MC_DATUM);
-    display.drawString("HOLD CANCEL", 237, 69, 2);
-    shownControls.state = printer.printState;
+  if (force || toolheadMessage != shownToolhead.message) {
+    display.fillRect(158, 184, 154, 19, kBlack);
+    display.setTextDatum(TR_DATUM);
+    display.setTextColor(toolheadMessage.startsWith("Failed") || toolheadMessage == "Movement locked"
+                             ? kRed
+                             : kWhite,
+                         kBlack);
+    display.drawString(shorten(toolheadMessage, 22), 310, 188, 1);
+    shownToolhead.message = toolheadMessage;
   }
-  if (force || printer.speedPercent != shownControls.speedPercent) {
-    display.fillRect(151, 102, 105, 30, kBlack);
+  shownToolhead.homedAxes = printer.homedAxes;
+}
+
+void drawExtruderLayout() {
+  drawPageTitle("EXTRUDER");
+  display.setTextDatum(TL_DATUM);
+  display.setTextColor(kYellow, kBlack);
+  display.drawString("NOZZLE", 12, 47, 2);
+  display.drawString("FLOW", 12, 78, 2);
+  drawButton(91, 70, 50, 34, "-");
+  display.drawRoundRect(147, 70, 107, 34, 5, kWhite);
+  drawButton(260, 70, 50, 34, "+");
+  display.drawRoundRect(10, 112, 145, 35, 5, kWhite);
+  display.drawRoundRect(165, 112, 145, 35, 5, kWhite);
+  display.setTextColor(kYellow, kBlack);
+  display.drawString("PRESSURE ADV", 16, 115, 1);
+  display.drawString("SMOOTH TIME", 171, 115, 1);
+  drawButton(10, 168, 145, 31, "RETRACT", kYellow);
+  drawButton(165, 168, 145, 31, "EXTRUDE", kYellow);
+  shownExtruder = ExtruderSnapshot{};
+}
+
+void renderExtruder(bool force = false) {
+  char temperature[24];
+  snprintf(temperature, sizeof(temperature), "%d/%d C", lroundf(printer.nozzleTemperature),
+           lroundf(printer.nozzleTarget));
+  const String temperatureText(temperature);
+  const String pressureText(printer.pressureAdvance, 3);
+  const String smoothText(printer.smoothTime, 3);
+
+  if (force || temperatureText != shownExtruder.temperature) {
+    display.fillRect(90, 43, 220, 24, kBlack);
+    display.setTextDatum(TR_DATUM);
     display.setTextColor(kWhite, kBlack);
-    display.setTextDatum(MC_DATUM);
-    display.drawString(String(printer.speedPercent) + "%", 203, 117, 4);
-    shownControls.speedPercent = printer.speedPercent;
+    display.drawString(temperatureText, 308, 47, 2);
+    shownExtruder.temperature = temperatureText;
   }
-  if (force || printer.flowPercent != shownControls.flowPercent) {
-    display.fillRect(151, 148, 105, 30, kBlack);
+  if (force || printer.flowPercent != shownExtruder.flowPercent) {
+    display.fillRect(149, 72, 103, 30, kBlack);
+    display.setTextDatum(MC_DATUM);
     display.setTextColor(kWhite, kBlack);
-    display.setTextDatum(MC_DATUM);
-    display.drawString(String(printer.flowPercent) + "%", 203, 163, 4);
-    shownControls.flowPercent = printer.flowPercent;
+    display.drawString(String(printer.flowPercent) + "%", 200, 87, 4);
+    shownExtruder.flowPercent = printer.flowPercent;
   }
-  if (force || controlMessage != shownControls.message) {
-    display.fillRect(10, 187, 300, 18, kBlack);
-    display.setTextColor(controlMessage.startsWith("Failed") ? kRed : kWhite, kBlack);
+  if (force || pressureText != shownExtruder.pressureAdvance) {
+    display.fillRect(15, 128, 135, 16, kBlack);
+    display.setTextDatum(TR_DATUM);
+    display.setTextColor(kWhite, kBlack);
+    display.drawString(pressureText + " s", 148, 129, 2);
+    shownExtruder.pressureAdvance = pressureText;
+  }
+  if (force || smoothText != shownExtruder.smoothTime) {
+    display.fillRect(170, 128, 135, 16, kBlack);
+    display.setTextDatum(TR_DATUM);
+    display.setTextColor(kWhite, kBlack);
+    display.drawString(smoothText + " s", 303, 129, 2);
+    shownExtruder.smoothTime = smoothText;
+  }
+  if (force || extruderMessage != shownExtruder.message) {
+    display.fillRect(10, 150, 300, 16, kBlack);
     display.setTextDatum(MC_DATUM);
-    display.drawString(shorten(controlMessage, 42), 160, 195, 2);
-    shownControls.message = controlMessage;
+    display.setTextColor(extruderMessage.startsWith("Failed") || extruderMessage.endsWith("locked")
+                             ? kRed
+                             : kWhite,
+                         kBlack);
+    const String message = extruderMessage.isEmpty() ? "25 mm  @  10 mm/s" : extruderMessage;
+    display.drawString(shorten(message, 42), 160, 157, 2);
+    shownExtruder.message = extruderMessage;
   }
 }
 
@@ -599,9 +704,13 @@ void redrawActivePage() {
       drawHealthLayout();
       renderHealth(true);
       break;
-    case Page::Controls:
-      renderControls();
-      updateControlValues(true);
+    case Page::Toolhead:
+      drawToolheadLayout();
+      renderToolhead(true);
+      break;
+    case Page::Extruder:
+      drawExtruderLayout();
+      renderExtruder(true);
       break;
     case Page::Ai:
       drawAiLayout();
@@ -702,9 +811,6 @@ bool readTouch(int &screenX, int &screenY) {
 
 void handleTouch() {
   static bool wasTouched = false;
-  static bool cancelArmed = false;
-  static bool cancelSent = false;
-  static unsigned long cancelStartedAt = 0;
   int x = 0;
   int y = 0;
   const bool isTouched = readTouch(x, y);
@@ -714,59 +820,89 @@ void handleTouch() {
     setBacklight(kBacklightBright);
   }
   if (isTouched && !wasTouched && !wasSleeping && y >= kNavigationTop) {
-    const Page selected = static_cast<Page>(constrain(x / 64, 0, 4));
+    const Page selected = static_cast<Page>(constrain((x * 6) / 320, 0, 5));
     if (selected != activePage) {
       activePage = selected;
       if (activePage == Page::Ai) lastAiPollAt = 0;
       redrawActivePage();
     }
   }
-  if (!isTouched) {
-    cancelArmed = false;
-    cancelSent = false;
-  }
-  if (activePage == Page::Controls && isTouched && !wasSleeping) {
-    if (!wasTouched) {
-      if (x >= 10 && x <= 155 && y >= 48 && y <= 90) {
-        const bool resume = printer.printState == "paused";
-        const bool pause = printer.printState == "printing";
-        const bool ok = (resume || pause) &&
-                        postMoonraker(resume ? "/printer/print/resume" : "/printer/print/pause");
-        controlMessage = !(resume || pause) ? "No active print"
-                         : ok              ? (resume ? "Resume requested" : "Pause requested")
-                                           : "Failed to send command";
-        updateControlValues(true);
-      } else if (x >= 165 && x <= 310 && y >= 48 && y <= 90 && printer.printState == "printing") {
-        cancelArmed = true;
-        cancelStartedAt = millis();
-        controlMessage = "Keep holding to cancel";
-        updateControlValues(true);
-      } else if (y >= 98 && y <= 136 && (x >= 102 && x <= 145 || x >= 264 && x <= 307)) {
-        const int delta = x < 200 ? -10 : 10;
-        const int requested = constrain(printer.speedPercent + delta, 50, 200);
-        const bool ok = printer.printState == "printing" &&
-                        postMoonraker(String("/printer/gcode/script?script=M220%20S") + requested);
-        controlMessage = printer.printState != "printing" ? "Speed changes require a print"
-                         : ok ? String("Speed requested: ") + requested + "%"
-                              : "Failed to set speed";
-        updateControlValues(true);
-      } else if (y >= 144 && y <= 182 && (x >= 102 && x <= 145 || x >= 264 && x <= 307)) {
-        const int delta = x < 200 ? -5 : 5;
-        const int requested = constrain(printer.flowPercent + delta, 50, 150);
-        const bool ok = printer.printState == "printing" &&
-                        postMoonraker(String("/printer/gcode/script?script=M221%20S") + requested);
-        controlMessage = printer.printState != "printing" ? "Flow changes require a print"
-                         : ok ? String("Flow requested: ") + requested + "%"
-                              : "Failed to set flow";
-        updateControlValues(true);
+  if (activePage == Page::Toolhead && isTouched && !wasTouched && !wasSleeping &&
+      y < kNavigationTop) {
+    const bool activePrint = printer.printState == "printing" || printer.printState == "paused";
+    if (x >= 8 && x <= 79 && y >= 82 && y <= 111) {
+      const bool ok = !activePrint && postMoonraker("/printer/gcode/script?script=G28");
+      toolheadMessage = activePrint ? "Movement locked" : ok ? "Homing requested" : "Failed to home";
+    } else if (y >= 82 && y <= 111 && (x >= 84 && x <= 139 || x >= 244 && x <= 312)) {
+      const int delta = x < 200 ? -10 : 10;
+      const int requested = constrain(printer.speedPercent + delta, 50, 200);
+      const bool ok = printer.printState == "printing" &&
+                      postMoonraker(String("/printer/gcode/script?script=M220%20S") + requested);
+      toolheadMessage = printer.printState != "printing" ? "Speed needs print"
+                            : ok                           ? String("Speed ") + requested + "%"
+                                                           : "Failed speed";
+    } else if (y >= 117 && y <= 181) {
+      String axis;
+      float amount = 0;
+      if (y <= 146 && x >= 8 && x <= 78) axis = "X", amount = -1;
+      else if (y <= 146 && x >= 86 && x <= 156) axis = "X", amount = 1;
+      else if (y <= 146 && x >= 164 && x <= 234) axis = "Y", amount = -1;
+      else if (y <= 146 && x >= 242 && x <= 312) axis = "Y", amount = 1;
+      else if (y >= 152 && x >= 8 && x <= 78) axis = "Z", amount = -1;
+      else if (y >= 152 && x >= 86 && x <= 156) axis = "Z", amount = 1;
+
+      if (!axis.isEmpty()) {
+        const char lowerAxis = axis[0] == 'X' ? 'x' : axis[0] == 'Y' ? 'y' : 'z';
+        const bool homed = printer.homedAxes.indexOf(lowerAxis) >= 0;
+        const String amountText = amount < 0 ? "-1" : "1";
+        const String path = String("/printer/gcode/script?script=SAVE_GCODE_STATE%20NAME=CYD_JOG%0A") +
+                            "G91%0AG0%20" + axis + amountText + "%20F1800%0A" +
+                            "RESTORE_GCODE_STATE%20NAME=CYD_JOG";
+        const bool ok = !activePrint && homed && postMoonraker(path);
+        toolheadMessage = activePrint ? "Movement locked"
+                          : !homed     ? axis + " not homed"
+                          : ok         ? axis + amountText + " mm"
+                                       : "Failed to jog";
+      } else if (y >= 152 && (x >= 164 && x <= 234 || x >= 242 && x <= 312)) {
+        const float adjustment = x < 240 ? -0.025f : 0.025f;
+        const bool homed = printer.homedAxes.indexOf('z') >= 0;
+        const bool inRange = fabsf(printer.zOffset + adjustment) <= 2.0f;
+        const String adjustmentText = adjustment < 0 ? "-0.025" : "0.025";
+        const String path = String("/printer/gcode/script?script=SET_GCODE_OFFSET%20Z_ADJUST=") +
+                            adjustmentText + "%20MOVE=1";
+        const bool ok = homed && inRange && postMoonraker(path);
+        toolheadMessage = !homed   ? "Z not homed"
+                          : !inRange ? "Offset limit"
+                          : ok       ? String("Offset ") + adjustmentText
+                                     : "Failed offset";
       }
     }
-    if (cancelArmed && !cancelSent && millis() - cancelStartedAt >= kCancelHoldMs) {
-      cancelSent = true;
-      const bool ok = postMoonraker("/printer/print/cancel");
-      controlMessage = ok ? "Print cancel requested" : "Failed to cancel print";
-      updateControlValues(true);
+    renderToolhead();
+  }
+  if (activePage == Page::Extruder && isTouched && !wasTouched && !wasSleeping &&
+      y < kNavigationTop) {
+    if (y >= 70 && y <= 104 && (x >= 91 && x <= 141 || x >= 260 && x <= 310)) {
+      const int delta = x < 200 ? -5 : 5;
+      const int requested = constrain(printer.flowPercent + delta, 50, 150);
+      const bool ok = printer.printState == "printing" &&
+                      postMoonraker(String("/printer/gcode/script?script=M221%20S") + requested);
+      extruderMessage = printer.printState != "printing" ? "Flow needs active print"
+                          : ok ? String("Flow ") + requested + "%" : "Failed flow";
+    } else if (y >= 168 && y <= 199 && (x >= 10 && x <= 155 || x >= 165 && x <= 310)) {
+      const bool activePrint = printer.printState == "printing" || printer.printState == "paused";
+      const bool hot = printer.nozzleTemperature >= 170.0f;
+      const bool extrude = x >= 165;
+      const String amount = extrude ? "25" : "-25";
+      const String path = String("/printer/gcode/script?script=SAVE_GCODE_STATE%20NAME=CYD_EXT%0A") +
+                          "M83%0AG1%20E" + amount + "%20F600%0A" +
+                          "RESTORE_GCODE_STATE%20NAME=CYD_EXT";
+      const bool ok = !activePrint && hot && postMoonraker(path);
+      extruderMessage = activePrint ? "Manual extrusion locked"
+                        : !hot       ? "Heat nozzle to 170 C"
+                        : ok         ? (extrude ? "Extruding 25 mm" : "Retracting 25 mm")
+                                     : "Failed extrusion";
     }
+    renderExtruder();
   }
   if (activePage == Page::Ai && isTouched && !wasTouched && !wasSleeping && y >= 163 && y <= 199) {
     if (!aiAssessment.analyzing) {
@@ -839,8 +975,11 @@ void refreshActivePage() {
     case Page::Health:
       renderHealth();
       break;
-    case Page::Controls:
-      updateControlValues();
+    case Page::Toolhead:
+      renderToolhead();
+      break;
+    case Page::Extruder:
+      renderExtruder();
       break;
     case Page::Ai:
       renderAi();
@@ -861,6 +1000,8 @@ void applyPrinterStatus(JsonObjectConst status) {
   if (!status["extruder"].isNull()) {
     printer.nozzleTemperature = status["extruder"]["temperature"] | printer.nozzleTemperature;
     printer.nozzleTarget = status["extruder"]["target"] | printer.nozzleTarget;
+    printer.pressureAdvance = status["extruder"]["pressure_advance"] | printer.pressureAdvance;
+    printer.smoothTime = status["extruder"]["smooth_time"] | printer.smoothTime;
   }
   if (!status["heater_bed"].isNull()) {
     printer.bedTemperature = status["heater_bed"]["temperature"] | printer.bedTemperature;
@@ -877,6 +1018,17 @@ void applyPrinterStatus(JsonObjectConst status) {
     const float flowFactor = status["gcode_move"]["extrude_factor"] | (printer.flowPercent / 100.0f);
     printer.speedPercent = constrain(static_cast<int>(lroundf(speedFactor * 100)), 1, 999);
     printer.flowPercent = constrain(static_cast<int>(lroundf(flowFactor * 100)), 1, 999);
+    const JsonArrayConst position = status["gcode_move"]["gcode_position"].as<JsonArrayConst>();
+    if (position.size() >= 3) {
+      printer.positionX = position[0] | printer.positionX;
+      printer.positionY = position[1] | printer.positionY;
+      printer.positionZ = position[2] | printer.positionZ;
+    }
+    const JsonArrayConst origin = status["gcode_move"]["homing_origin"].as<JsonArrayConst>();
+    if (origin.size() >= 3) printer.zOffset = origin[2] | printer.zOffset;
+  }
+  if (!status["toolhead"].isNull()) {
+    printer.homedAxes = String(status["toolhead"]["homed_axes"] | printer.homedAxes.c_str());
   }
   const JsonObjectConst switchSensor = status["filament_switch_sensor sfs_switch"];
   const JsonObjectConst motionSensor = status["filament_motion_sensor sfs_motion"];
@@ -912,6 +1064,8 @@ void sendSubscription() {
   JsonArray extruder = objects["extruder"].to<JsonArray>();
   extruder.add("temperature");
   extruder.add("target");
+  extruder.add("pressure_advance");
+  extruder.add("smooth_time");
   JsonArray bed = objects["heater_bed"].to<JsonArray>();
   bed.add("temperature");
   bed.add("target");
@@ -921,6 +1075,9 @@ void sendSubscription() {
   JsonArray gcodeMove = objects["gcode_move"].to<JsonArray>();
   gcodeMove.add("speed_factor");
   gcodeMove.add("extrude_factor");
+  gcodeMove.add("gcode_position");
+  gcodeMove.add("homing_origin");
+  objects["toolhead"].to<JsonArray>().add("homed_axes");
   objects["filament_switch_sensor sfs_switch"].to<JsonArray>().add("filament_detected");
   objects["filament_motion_sensor sfs_motion"].to<JsonArray>().add("filament_detected");
   objects["temperature_sensor btt_eddy_mcu"].to<JsonArray>().add("temperature");
@@ -1052,8 +1209,9 @@ bool pollMoonraker() {
   HTTPClient http;
   const String endpoint = String("http://") + MOONRAKER_HOST + ":" + MOONRAKER_PORT +
       "/printer/objects/query?webhooks&print_stats&virtual_sdcard&"
-      "extruder=temperature,target&heater_bed=temperature,target&display_status=progress,message&"
-      "gcode_move=speed_factor,extrude_factor&"
+      "extruder=temperature,target,pressure_advance,smooth_time&heater_bed=temperature,target&"
+      "display_status=progress,message&toolhead=homed_axes&"
+      "gcode_move=speed_factor,extrude_factor,gcode_position,homing_origin&"
       "filament_switch_sensor%20sfs_switch=filament_detected&"
       "filament_motion_sensor%20sfs_motion=filament_detected&"
       "temperature_sensor%20btt_eddy_mcu=temperature";
@@ -1132,6 +1290,10 @@ void loop() {
       renderModel();
     } else if (activePage == Page::Health) {
       renderHealth();
+    } else if (activePage == Page::Toolhead) {
+      renderToolhead();
+    } else if (activePage == Page::Extruder) {
+      renderExtruder();
     }
     updateRgb();
   }

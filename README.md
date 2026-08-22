@@ -12,10 +12,14 @@ ESP32-2432S028R Cheap Yellow Display.
 
 - Flicker-free partial redraws on a black, white, red, and yellow interface
 - Moonraker WebSocket updates with automatic REST fallback
-- Dashboard for state, temperatures, filename, progress, and elapsed time
+- HOME page with a 70% model preview and a 30% live panel for temperatures,
+  progress, and estimated time remaining
+- Dedicated full model-preview page with live filename and progress
 - Health page for Wi-Fi, Moonraker, BTT SFS V2.0, and BTT Eddy temperature
-- Touch controls for pause/resume, speed, and flow during an active print
-- Two-second hold confirmation before canceling a print
+- TOOL page with live X/Y/Z position, homing, 1 mm jogging, Z-offset adjustment,
+  and print-speed control
+- EXT page with nozzle temperature, flow, pressure advance, smooth time, and
+  manual 25 mm retract/extrude at 10 mm/s
 - RGB status LED: white ready, yellow printing, blue paused, red alert/offline
 - Automatic backlight dimming, sleep, and touch-to-wake
 - Optional camera analysis through a separate CM4/OpenAI gateway
@@ -72,7 +76,7 @@ pio run --target upload
 pio device monitor
 ```
 
-The confirmed CYD serial port on this Mac is `/dev/cu.usbserial-13140`.
+The confirmed CYD serial port on this Mac is `/dev/cu.usbserial-11310`.
 Building does not modify the device. Uploading replaces its firmware and starts
 the touchscreen calibration flow.
 
@@ -81,8 +85,12 @@ the touchscreen calibration flow.
 - Status and AI features are read-only.
 - Speed and flow are limited to 50-200% and 50-150%, respectively.
 - Speed and flow buttons work only while Moonraker reports an active print.
-- Pause/resume is available only in the matching print state.
-- Cancel requires a continuous two-second hold.
+- Homing, 1 mm jogging, and manual extrusion are blocked during active or
+  paused prints.
+- Manual extrusion is blocked below 170 C and uses the calibrated 10 mm/s
+  feedrate.
+- Live Z-offset adjustment uses 0.025 mm steps and is limited to +/-2 mm.
+- The display does not expose `SAVE_CONFIG`, which could restart Klipper.
 - No automatic action is taken from an AI assessment.
 
 ## Development tests
