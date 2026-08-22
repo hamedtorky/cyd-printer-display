@@ -88,7 +88,9 @@ the touchscreen calibration flow.
 ## Wi-Fi firmware updates
 
 Firmware v0.4.0 and later can update over Wi-Fi using the existing ESP32 OTA
-bootloader partitions. USB remains available as the recovery path.
+bootloader partitions. After the first OTA-capable firmware is installed, the
+display does not need to be connected to the development Mac for normal
+updates. USB remains available as the recovery path.
 
 For a future release, update `CYD_FIRMWARE_VERSION` in
 `include/firmware_version.h`, then publish the build to the CM4:
@@ -104,6 +106,17 @@ The display checks the manifest after connecting to Wi-Fi. Open **HEALTH** to
 see the result. When a newer version is available and the printer is idle, hold
 the update button for two seconds. The ESP downloads into the inactive OTA
 partition, verifies the complete SHA-256 digest, activates it, and restarts.
+Wi-Fi configuration and touch calibration are retained across the update.
+
+The release flow is:
+
+1. Change `CYD_FIRMWARE_VERSION` and run `tools/publish_ota.sh` on the Mac.
+2. Wait until the printer is idle.
+3. On the display, open **HEALTH** and tap **CHECK UPDATE** if necessary.
+4. Hold **HOLD TO INSTALL** for two seconds and allow the display to restart.
+
+Version 0.4.1 was the first update published and verified through this network
+workflow without connecting the display to the Mac.
 
 ## Safety model
 
