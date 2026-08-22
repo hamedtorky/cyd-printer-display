@@ -10,7 +10,6 @@
 #include <XPT2046_Touchscreen.h>
 
 #include "config.h"
-#include "current_model_preview.h"
 
 #ifndef AI_GATEWAY_HOST
 #define AI_GATEWAY_HOST "printer.lan"
@@ -45,6 +44,10 @@ constexpr int kLedGreen = 16;
 constexpr int kLedBlue = 17;
 constexpr int kNavigationTop = 207;
 constexpr unsigned long kAiPollIntervalMs = 5000;
+constexpr unsigned long kPreviewRetryMs = 10000;
+constexpr uint16_t kModelPreviewWidth = 220;
+constexpr uint16_t kModelPreviewHeight = 145;
+constexpr size_t kModelPreviewBytes = kModelPreviewWidth * kModelPreviewHeight * 2;
 
 TFT_eSPI display;
 SPIClass touchSpi(VSPI);
@@ -57,6 +60,11 @@ unsigned long lastInteractionAt = 0;
 unsigned long lastAiPollAt = 0;
 bool socketConnected = false;
 String socketHeaders;
+uint16_t modelPreviewPixels[kModelPreviewWidth * kModelPreviewHeight];
+bool modelPreviewReady = false;
+String modelPreviewFilename;
+String modelPreviewError;
+unsigned long lastPreviewAttemptAt = 0;
 
 enum class Page : uint8_t { Dashboard, Model, Health, Toolhead, Extruder, Ai };
 Page activePage = Page::Dashboard;
@@ -183,6 +191,7 @@ AiSnapshot shownAi;
 
 bool postMoonraker(const String &path);
 bool requestAiAnalysis();
+bool fetchModelPreview();
 
 String shorten(const String &value, size_t maximum) {
   if (value.length() <= maximum) return value;
@@ -269,12 +278,24 @@ void drawNavigation() {
   }
 }
 
+void drawModelPreview(int x, int y) {
+  display.fillRect(x, y, kModelPreviewWidth, kModelPreviewHeight, kBlack);
+  if (modelPreviewReady) {
+    display.pushImage(x, y, kModelPreviewWidth, kModelPreviewHeight, modelPreviewPixels);
+    return;
+  }
+  display.setTextDatum(MC_DATUM);
+  display.setTextColor(modelPreviewError.isEmpty() ? kYellow : kRed, kBlack);
+  display.drawString(modelPreviewError.isEmpty() ? "LOADING MODEL" : "PREVIEW RETRY", x + 110,
+                     y + 67, 2);
+}
+
 void drawStaticLayout() {
   display.fillScreen(kBlack);
 
   // HOME uses 70% of the content width for the model and 30% for live status.
   display.drawRect(3, 41, kModelPreviewWidth + 2, kModelPreviewHeight + 2, kYellow);
-  display.pushImage(4, 42, kModelPreviewWidth, kModelPreviewHeight, kModelPreview);
+  drawModelPreview(4, 42);
   display.drawRoundRect(228, 41, 89, 163, 6, kWhite);
   display.setTextDatum(TL_DATUM);
   display.setTextColor(kYellow, kBlack);
@@ -390,7 +411,7 @@ void drawHealthLayout() {
 void drawModelLayout() {
   drawPageTitle("PRINT MODEL");
   display.drawRect(49, 41, kModelPreviewWidth + 2, kModelPreviewHeight + 2, kYellow);
-  display.pushImage(50, 42, kModelPreviewWidth, kModelPreviewHeight, kModelPreview);
+  drawModelPreview(50, 42);
   shownModel = ModelSnapshot{};
 }
 
@@ -993,9 +1014,16 @@ void applyPrinterStatus(JsonObjectConst status) {
     printer.klippyState = status["webhooks"]["state"] | printer.klippyState;
   }
   if (!status["print_stats"].isNull()) {
+    const String previousPrintState = printer.printState;
     printer.printState = status["print_stats"]["state"] | printer.printState;
     printer.filename = String(status["print_stats"]["filename"] | printer.filename.c_str());
     printer.printDuration = status["print_stats"]["print_duration"] | printer.printDuration;
+    if (printer.printState == "printing" && previousPrintState != "printing" &&
+        previousPrintState != "paused") {
+      modelPreviewReady = false;
+      modelPreviewFilename = "";
+      lastPreviewAttemptAt = 0;
+    }
   }
   if (!status["extruder"].isNull()) {
     printer.nozzleTemperature = status["extruder"]["temperature"] | printer.nozzleTemperature;
@@ -1146,6 +1174,54 @@ void addGatewayToken(HTTPClient &http) {
   if (strlen(AI_GATEWAY_TOKEN) > 0) http.addHeader("X-Display-Token", AI_GATEWAY_TOKEN);
 }
 
+bool fetchModelPreview() {
+  if (WiFi.status() != WL_CONNECTED || printer.filename.isEmpty()) return false;
+  WiFiClient client;
+  HTTPClient http;
+  const String endpoint = String("http://") + AI_GATEWAY_HOST + ":" + AI_GATEWAY_PORT +
+                          "/v1/model-preview";
+  http.setConnectTimeout(2000);
+  http.setTimeout(30000);
+  if (!http.begin(client, endpoint)) return false;
+  addGatewayToken(http);
+  const int statusCode = http.GET();
+  if (statusCode != HTTP_CODE_OK || http.getSize() != static_cast<int>(kModelPreviewBytes)) {
+    modelPreviewError = String("HTTP ") + statusCode;
+    http.end();
+    return false;
+  }
+  WiFiClient *stream = http.getStreamPtr();
+  const size_t received =
+      stream->readBytes(reinterpret_cast<char *>(modelPreviewPixels), kModelPreviewBytes);
+  http.end();
+  if (received != kModelPreviewBytes) {
+    modelPreviewError = "Short preview";
+    return false;
+  }
+  modelPreviewError = "";
+  return true;
+}
+
+void refreshModelPreviewIfNeeded(unsigned long now) {
+  if (printer.filename.isEmpty() ||
+      (modelPreviewReady && printer.filename == modelPreviewFilename)) {
+    return;
+  }
+  if (lastPreviewAttemptAt != 0 && now - lastPreviewAttemptAt < kPreviewRetryMs) return;
+  lastPreviewAttemptAt = now;
+  modelPreviewReady = false;
+  modelPreviewError = "";
+  if (activePage == Page::Dashboard) drawModelPreview(4, 42);
+  if (activePage == Page::Model) drawModelPreview(50, 42);
+
+  if (fetchModelPreview()) {
+    modelPreviewFilename = printer.filename;
+    modelPreviewReady = true;
+  }
+  if (activePage == Page::Dashboard) drawModelPreview(4, 42);
+  if (activePage == Page::Model) drawModelPreview(50, 42);
+}
+
 bool requestAiAnalysis() {
   if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClient client;
@@ -1272,6 +1348,7 @@ void setup() {
 void loop() {
   const unsigned long now = millis();
   moonrakerSocket.loop();
+  refreshModelPreviewIfNeeded(now);
 
   if (WiFi.status() != WL_CONNECTED && now - lastWifiAttemptAt >= kWifiRetryMs) {
     lastWifiAttemptAt = now;

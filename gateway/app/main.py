@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import secrets
 import time
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi.responses import Response
 
 from .analyzers import Analyzer, create_analyzer
 from .config import Settings
 from .models import AnalysisStart, Assessment, Health
-from .sources import SourceError, fetch_camera, fetch_telemetry
+from .preview import HEIGHT as PREVIEW_HEIGHT
+from .preview import WIDTH as PREVIEW_WIDTH
+from .preview import PreviewError, render_preview
+from .sources import SourceError, fetch_active_gcode, fetch_camera, fetch_telemetry
 
 
 class GatewayState:
@@ -22,6 +27,10 @@ class GatewayState:
         self.latest: Assessment | None = None
         self.last_started_at = 0.0
         self.lock = asyncio.Lock()
+        self.preview_lock = asyncio.Lock()
+        self.preview_filename = ""
+        self.preview_digest = b""
+        self.preview_pixels = b""
         self.task: asyncio.Task[None] | None = None
 
     async def close(self) -> None:
@@ -95,6 +104,34 @@ def create_app(settings: Settings | None = None, analyzer: Analyzer | None = Non
     @app.get("/v1/assessment", response_model=Assessment | None, dependencies=[Depends(authorize)])
     async def latest_assessment() -> Assessment | None:
         return state_holder.latest
+
+    @app.get("/v1/model-preview", dependencies=[Depends(authorize)])
+    async def model_preview() -> Response:
+        async with state_holder.preview_lock:
+            try:
+                filename, gcode = await fetch_active_gcode(
+                    state_holder.settings, state_holder.client
+                )
+                digest = hashlib.blake2s(gcode).digest()
+                if (filename != state_holder.preview_filename or
+                        digest != state_holder.preview_digest or
+                        not state_holder.preview_pixels):
+                    state_holder.preview_pixels = await asyncio.to_thread(render_preview, gcode)
+                    state_holder.preview_filename = filename
+                    state_holder.preview_digest = digest
+            except (SourceError, PreviewError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+                ) from exc
+        return Response(
+            content=state_holder.preview_pixels,
+            media_type="application/x-rgb565",
+            headers={
+                "X-Preview-Width": str(PREVIEW_WIDTH),
+                "X-Preview-Height": str(PREVIEW_HEIGHT),
+                "Cache-Control": "no-store",
+            },
+        )
 
     @app.post("/v1/analyze", response_model=Assessment, dependencies=[Depends(authorize)])
     async def analyze() -> Assessment:

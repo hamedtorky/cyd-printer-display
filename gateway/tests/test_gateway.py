@@ -9,6 +9,15 @@ from app.main import create_app
 
 
 def moonraker_response(_: httpx.Request) -> httpx.Response:
+    if _.url.path.startswith("/server/files/gcodes/"):
+        return httpx.Response(
+            200,
+            content=(
+                b";LAYER:0\n;TYPE:WALL-OUTER\nM82\nG92 E0\n"
+                b"G1 X0 Y0 Z0.2 E0\nG1 X20 Y0 E1\nG1 X20 Y20 E2\n"
+                b"G1 X0 Y20 E3\nG1 X0 Y0 E4\n"
+            ),
+        )
     return httpx.Response(
         200,
         json={
@@ -72,6 +81,7 @@ def test_rate_limit() -> None:
 def test_optional_display_token() -> None:
     with build_client("secret") as client:
         assert client.get("/v1/assessment").status_code == 401
+        assert client.get("/v1/model-preview").status_code == 401
         assert client.get(
             "/v1/assessment", headers={"X-Display-Token": "secret"}
         ).status_code == 200
@@ -82,3 +92,13 @@ def test_background_analysis_start() -> None:
         response = client.post("/v1/analyze/start")
         assert response.status_code == 202
         assert response.json() == {"accepted": True, "status": "started"}
+
+
+def test_model_preview_is_rgb565() -> None:
+    with build_client() as client:
+        response = client.get("/v1/model-preview")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/x-rgb565"
+        assert response.headers["x-preview-width"] == "220"
+        assert response.headers["x-preview-height"] == "145"
+        assert len(response.content) == 220 * 145 * 2

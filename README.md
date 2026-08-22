@@ -14,6 +14,8 @@ ESP32-2432S028R Cheap Yellow Display.
 - Moonraker WebSocket updates with automatic REST fallback
 - HOME page with a 70% model preview and a 30% live panel for temperatures,
   progress, and estimated time remaining
+- Automatic per-print model previews generated from the active G-code on the
+  CM4, with embedded slicer-thumbnail support and extrusion-path fallback
 - Dedicated full model-preview page with live filename and progress
 - Health page for Wi-Fi, Moonraker, BTT SFS V2.0, and BTT Eddy temperature
 - TOOL page with live X/Y/Z position, homing, 1 mm jogging, Z-offset adjustment,
@@ -32,15 +34,16 @@ cancel a print.
 ```text
 CYD ESP32 <--WebSocket/HTTP--> Moonraker
     |
-    +------HTTP------> CM4 AI gateway ----> OpenAI Responses API
-                           |                     (optional)
+    +------HTTP------> CM4 gateway ----> OpenAI Responses API (optional)
                            +----> Crowsnest snapshot
                            +----> Moonraker telemetry
+                           +----> Active G-code preview (cached RGB565)
 ```
 
 The OpenAI API key remains in the gateway's environment on the CM4. It is never
 stored on the ESP32. See [gateway setup](gateway/README.md) for mock mode,
-OpenAI configuration, limits, and future local-model support.
+OpenAI configuration, automatic model previews, limits, and future local-model
+support.
 
 ## Firmware configuration
 

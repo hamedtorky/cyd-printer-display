@@ -16,6 +16,7 @@ class Settings:
     gateway_token: str = ""
     min_analysis_interval_seconds: int = 60
     max_image_bytes: int = 5_000_000
+    max_gcode_bytes: int = 100_000_000
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -34,5 +35,5 @@ class Settings:
                 10, int(os.getenv("MIN_ANALYSIS_INTERVAL_SECONDS", "60"))
             ),
             max_image_bytes=max(100_000, int(os.getenv("MAX_IMAGE_BYTES", "5000000"))),
+            max_gcode_bytes=max(1_000_000, int(os.getenv("MAX_GCODE_BYTES", "100000000"))),
         )
-
