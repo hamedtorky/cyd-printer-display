@@ -3,7 +3,7 @@
 Touchscreen Klipper cockpit and optional cloud print-quality assistant for the
 ESP32-2432S028R Cheap Yellow Display.
 
-![CYD Printer Display showing live Klipper status](image/image_1.png)
+![CYD Printer Display showing live Klipper status](image/image_2.png)
 
 ## Features
 
